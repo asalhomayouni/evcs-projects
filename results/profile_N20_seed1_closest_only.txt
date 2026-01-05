@@ -1,0 +1,48 @@
+         174559224 function calls (172115387 primitive calls) in 61.765 seconds
+
+   Ordered by: cumulative time
+   List reduced from 869 to 40 due to restriction <40>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        2    0.000    0.000   61.764   30.882 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\IPython\core\interactiveshell.py:3663(run_code)
+        2    0.000    0.000   61.764   30.882 {built-in method builtins.exec}
+        1    0.000    0.000   61.764   61.764 C:\Users\asus\AppData\Local\Temp\ipykernel_10668\2308076794.py:1(<module>)
+        1    0.005    0.005   61.764   61.764 C:\Users\asus\OneDrive\EV-projects\evcs-projects\scripts\destruction_reconstruction.py:59(run_one_policy)
+       64    0.091    0.001   60.570    0.946 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:346(local_search)
+    32533    3.061    0.000   48.635    0.001 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:359(reassign_y)
+ 17259294    6.394    0.000   27.001    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\set.py:536(__contains__)
+   650660    3.041    0.000   21.876    0.000 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:365(<listcomp>)
+  4211950    1.027    0.000   16.607    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\var.py:197(value)
+  4212082    5.683    0.000   15.580    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\var.py:134(set_value)
+ 13047564    4.241    0.000   13.344    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\set.py:1325(get)
+10160534/8313970    1.989    0.000   12.250    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\common\numeric_types.py:331(value)
+    16487    0.024    0.000   11.315    0.001 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\objective.py:465(__call__)
+    16421    0.013    0.000   11.315    0.001 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:383(objective)
+    16487    0.030    0.000   11.283    0.001 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\expression.py:58(__call__)
+    16507    0.019    0.000   11.245    0.001 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\expr\base.py:102(__call__)
+    16507    0.040    0.000   11.223    0.001 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\expr\visitor.py:1279(evaluate_expression)
+    16773    4.792    0.000   11.190    0.001 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\expr\visitor.py:887(dfs_postorder_stack)
+ 13047788    8.453    0.000    9.104    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\indexed_component.py:44(normalize_index)
+  4211994    2.864    0.000    6.594    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\set.py:2738(get)
+  5556159    2.185    0.000    4.684    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\expr\visitor.py:1202(visiting_potential_leaf)
+  8531531    3.038    0.000    4.595    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\var.py:965(__getitem__)
+   650660    1.680    0.000    3.896    0.000 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:366(<listcomp>)
+  4211994    0.720    0.000    3.391    0.000 {built-in method builtins.any}
+  8423988    1.386    0.000    3.009    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\set.py:2745(<genexpr>)
+  4211994    1.579    0.000    1.623    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\range.py:160(__contains__)
+  8533769    1.557    0.000    1.557    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\indexed_component.py:613(__getitem__)
+       63    0.090    0.001    0.925    0.015 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\block.py:1267(clone)
+  1846544    0.510    0.000    0.833    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\var.py:201(__call__)
+  1386/63    0.003    0.000    0.831    0.013 c:\Users\asus\miniconda3\envs\evcs\Lib\copy.py:128(deepcopy)
+   126/63    0.010    0.000    0.830    0.013 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\base\component.py:100(__deepcopy__)
+  1863051    0.468    0.000    0.759    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\core\expr\visitor.py:1198(visit)
+81207/25893    0.092    0.000    0.752    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\common\autoslots.py:319(__deepcopy_state__)
+    32533    0.317    0.000    0.683    0.000 C:\Users\asus\OneDrive\EV-projects\evcs-projects\src\evcs\methods.py:360(<dictcomp>)
+  9397060    0.670    0.000    0.670    0.000 {built-in method builtins.isinstance}
+13140597/13139394    0.659    0.000    0.659    0.000 {built-in method builtins.len}
+81207/25893    0.050    0.000    0.584    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\common\autoslots.py:381(<listcomp>)
+547092/161217    0.156    0.000    0.582    0.000 c:\Users\asus\miniconda3\envs\evcs\Lib\site-packages\pyomo\common\autoslots.py:102(fast_deepcopy)
+   554950    0.295    0.000    0.572    0.000 {built-in method builtins.sorted}
+  7734828    0.475    0.000    0.475    0.000 {method 'append' of 'list' objects}
+
+

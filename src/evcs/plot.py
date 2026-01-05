@@ -54,15 +54,7 @@ def plot_solution_pretty(
     show_self: str = "ring",  
     eps: float = 1e-6
 ) -> None:
-    """
-    Pretty plot:
-      - grey = all nodes
-      - green = served demand nodes
-      - red triangles = opened stations
-      - green lines between demand and station (for every y[i,j] > eps)
-      - distance label on each line
-      - 'f=..' (sum_j y[i,j]) next to each served demand node
-    """
+    
     # which stations are opened 
     opened_J = [j for j in m.J if _v(m.x[j]) > 0.5]
     opened_rows = [J_idx[j] for j in opened_J]
@@ -114,13 +106,20 @@ def plot_solution_pretty(
                              color="green", alpha=0.7, linewidth=1.5)
                 continue
 
-            # edge
-            plt.plot([xi, xj], [yi, yj], color="green", alpha=0.45, linewidth=1.6)
-
+        # edge
+        dx = xj - xi
+        dy = yj - yi
+        plt.arrow(
+            xi, yi,
+            dx * 0.85, dy * 0.85,  # shorten arrow a bit for aesthetics
+            head_width=0.05, head_length=0.08,
+            fc="green", ec="green", alpha=0.8,
+            length_includes_head=True
+        )
             # true distance label at midpoint
-            dij = math.hypot(float(xi - xj), float(yi - yj))
-            mx, my = (xi + xj) / 2.0, (yi + yj) / 2.0
-            plt.annotate(f"{dij:.2f}", (mx, my),
+        dij = math.hypot(float(xi - xj), float(yi - yj))
+        mx, my = (xi + xj) / 2.0, (yi + yj) / 2.0
+        plt.annotate(f"{dij:.2f}", (mx, my),
                          textcoords="offset points", xytext=(0, 0),
                          ha="center", va="center", fontsize=8, color="darkgreen")
 
@@ -143,3 +142,17 @@ def plot_solution_pretty(
     plt.grid(True); plt.legend()
 def plot_assignments_verbose(*args, **kwargs):
     return plot_solution_pretty(*args, **kwargs)
+
+# helper, observe all allowed arcs
+def plot_allowed_arcs(location_df, I_idx, J_idx, in_range, alpha=0.25):
+    """Draw all allowed arcs (i->j) in light gray."""
+    import matplotlib.pyplot as plt
+    for (i, j) in in_range:
+        irow, jrow = I_idx[i], J_idx[j]
+        xi, yi = location_df.loc[irow, ["x", "y"]]
+        xj, yj = location_df.loc[jrow, ["x", "y"]]
+        if irow == jrow:
+            # self: small gray ring
+            plt.scatter([xi], [yi], s=120, facecolors="none", edgecolors="gray", alpha=alpha)
+        else:
+            plt.plot([xi, xj], [yi, yj], color="gray", alpha=alpha, linewidth=1.0)

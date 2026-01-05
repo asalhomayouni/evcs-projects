@@ -1,0 +1,7 @@
+group,tottime_s,tottime_%
+other,39.024,63.36
+membership checks,8.177,13.28
+pyomo internals,5.737,9.32
+your code (other),5.404,8.77
+reassign_y,3.154,5.12
+local_search,0.092,0.15

@@ -1,0 +1,26 @@
+cumtime (s),cumtime (% of total),tottime (s),tottime (% of total),ncalls,function,location
+61.588,100.0,0.005,0.008,1,run_one_policy,destruction_reconstruction.py:59
+60.428,98.117,0.092,0.149,60,local_search,methods.py:346
+48.676,79.035,3.154,5.121,31126,reassign_y,methods.py:359
+27.063,43.943,6.574,10.673,16511859,__contains__,set.py:536
+21.851,35.479,3.059,4.966,622520,<listcomp>,methods.py:365
+16.618,26.983,1.026,1.665,4029035,value,var.py:197
+15.593,25.318,5.596,9.086,4029167,set_value,var.py:134
+13.171,21.386,4.204,6.826,12483044,get,set.py:1325
+12.077,19.609,1.996,3.24,9718166,value,numeric_types.py:331
+11.126,18.066,0.013,0.021,15699,objective,methods.py:383
+11.125,18.063,0.025,0.041,15761,__call__,objective.py:465
+11.089,18.005,0.033,0.053,15761,__call__,expression.py:58
+11.049,17.94,0.019,0.031,15781,__call__,base.py:102
+11.027,17.904,0.04,0.065,15781,evaluate_expression,visitor.py:1279
+10.992,17.848,4.673,7.588,16047,dfs_postorder_stack,visitor.py:887
+8.968,14.561,8.326,13.519,12483268,normalize_index,indexed_component.py:44
+6.65,10.798,2.871,4.662,4029079,get,set.py:2738
+4.657,7.562,2.169,3.521,5311497,visiting_potential_leaf,visitor.py:1202
+4.537,7.367,3.001,4.873,8161147,__getitem__,var.py:965
+3.841,6.237,1.684,2.735,622520,<listcomp>,methods.py:366
+3.442,5.589,0.718,1.166,4029079,<built-in method builtins.any>,~:0
+3.061,4.971,1.413,2.295,8058158,<genexpr>,set.py:2745
+1.648,2.676,1.603,2.603,4029079,__contains__,range.py:160
+1.537,2.495,1.537,2.495,8163305,__getitem__,indexed_component.py:613
+0.912,1.482,0.087,0.141,59,clone,block.py:1267

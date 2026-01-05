@@ -1,13 +1,7 @@
 import numpy as np
 from scipy.spatial.distance import cdist
 
-def build_arcs(coords_I, coords_J, D, *, forbid_self=False, I_idx=None, J_idx=None):
-    """
-    Returns (distIJ, in_range, Ji, Ij).
-    - in_range: list[(i,j)] with dist <= D and (optionally) i's original row != j's original row.
-    - Ji[i]: list of feasible j for that i.
-    - Ij[j]: list of i that can go to j.
-    """
+def build_arcs(coords_I, coords_J, D, *, forbid_self=True, I_idx=None, J_idx=None):
     coords_I = np.asarray(coords_I, float)
     coords_J = np.asarray(coords_J, float)
     distIJ = cdist(coords_I, coords_J, metric="euclidean")
@@ -29,7 +23,6 @@ def build_arcs(coords_I, coords_J, D, *, forbid_self=False, I_idx=None, J_idx=No
     return distIJ, in_range, Ji, Ij
 
 def compute_farther(distIJ, in_range, Ji):
-    """For each feasible pair (i,j), list the j' that are strictly farther than j."""
     farther_of = {}
     for (i, j) in in_range:
         d_ij = distIJ[i, j]
@@ -37,3 +30,13 @@ def compute_farther(distIJ, in_range, Ji):
         if farther:
             farther_of[(i, j)] = farther
     return farther_of
+import numpy as np
+
+def pairwise_dist(coords_I, coords_J):
+    coords_I = np.asarray(coords_I)
+    coords_J = np.asarray(coords_J)
+    dists = np.sqrt(
+        (coords_I[:, np.newaxis, 0] - coords_J[np.newaxis, :, 0]) ** 2 +
+        (coords_I[:, np.newaxis, 1] - coords_J[np.newaxis, :, 1]) ** 2
+    )
+    return dists

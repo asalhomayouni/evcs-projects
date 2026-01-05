@@ -1,0 +1,6 @@
+metric,value
+n_open_A,4
+n_open_B,4
+only_A,"[2, 4, 6]"
+only_B,"[12, 13, 14]"
+common,[19]

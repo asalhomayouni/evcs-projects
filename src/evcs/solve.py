@@ -1,24 +1,70 @@
-def solve_model(m, verbose=False):
+# src/evcs/solve.py
+import os
+from pyomo.contrib.appsi.solvers import Highs
+from pyomo.opt import TerminationCondition
+
+def solve_model(
+    m,
+    time_limit=300,     # seconds (default 5 minutes)
+    mip_gap=0.01,       # relative MIP gap (1%)
+    threads=None,       # default: all cores - 1
+    presolve=True,
+    verbose=False
+):
     """
-    Prefer HiGHS (pure Python wheel) then fall back to GLPK / CBC if installed.
+    Solve a Pyomo model using the HiGHS solver (Appsi interface).
+    Configured with safe defaults for performance and reproducibility.
+
+    Parameters
+    ----------
+    m : ConcreteModel
+        Pyomo model to solve.
+    time_limit : float, optional
+        Maximum runtime in seconds (default: 300).
+    mip_gap : float, optional
+        Relative MIP optimality gap (default: 0.01 = 1%).
+    threads : int, optional
+        Number of threads to use (default: os.cpu_count() - 1).
+    presolve : bool, optional
+        Whether to enable presolve (default: True).
+    verbose : bool, optional
+        Whether to print solver logs (default: False).
+
+    Returns
+    -------
+    res : Results object
+        The solver results (contains termination condition, status, etc.).
     """
-    # 1) HiGHS via appsi
+
+    opt = Highs()
+
+    # Configure solver options safely
     try:
-        from pyomo.contrib.appsi.solvers.highs import Highs
-        opt = Highs()
-        try: opt.config.stream_solver = bool(verbose)
-        except Exception: pass
-        return opt.solve(m)
+        opt.config.stream_solver = bool(verbose)
     except Exception:
         pass
 
-    # 2) Classic Pyomo solvers
-    from pyomo.environ import SolverFactory
-    for name in ("glpk", "cbc"):
-        try:
-            opt = SolverFactory(name)
-            return opt.solve(m, tee=verbose)
-        except Exception:
-            continue
+    if threads is None:
+        threads = max(1, (os.cpu_count() or 2) - 1)
 
-    raise RuntimeError("No solver available (install highspy OR glpk-utils OR coinor-cbc).")
+    def safe_set(attr, value):
+        try:
+            setattr(opt.config, attr, value)
+        except Exception:
+            pass
+
+    # Apply solver options
+    safe_set("time_limit", float(time_limit))
+    safe_set("mip_rel_gap", float(mip_gap))
+    safe_set("threads", int(threads))
+    safe_set("presolve", "on" if presolve else "off")
+
+    # Solve model
+    res = opt.solve(m)
+
+    # Report short summary
+    term = getattr(res, "termination_condition", "unknown")
+    if verbose:
+        print(f"✅ Solver finished with status: {term}")
+
+    return res

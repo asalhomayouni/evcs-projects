@@ -1,0 +1,9 @@
+N,policy,model_distance,heur_distance,model_covered,heur_covered,model_time,heur_time,distance_gap,relative_distance_error,time_ratio
+20,closest_only,31.624,0.0,60.0,66.92,0.134,0.008,-31.624,-100.0,0.063
+20,closest_priority,26.784,0.0,60.0,66.92,0.142,0.015,-26.784,-100.0,0.103
+20,system_optimum,25.285,0.0,60.0,66.92,0.088,0.004,-25.285,-100.0,0.041
+20,uniform,,0.0,,66.92,,0.002,,,
+40,closest_only,69.902,0.0,110.612,112.296,5.845,0.032,-69.902,-100.0,0.005
+40,closest_priority,62.356,0.0,112.296,112.296,0.819,0.136,-62.356,-100.0,0.167
+40,system_optimum,61.952,0.0,112.296,112.296,0.155,0.022,-61.952,-100.0,0.14
+40,uniform,,0.0,,112.296,,0.025,,,
