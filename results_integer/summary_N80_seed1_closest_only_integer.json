@@ -1,0 +1,21 @@
+{
+  "MODE": "integer",
+  "N": 80,
+  "seed": 1,
+  "policy": "closest_only",
+  "P": 21,
+  "Q": 34.285714285714285,
+  "D": 2.8,
+  "max_iter": 50,
+  "dr_time_limit": 300.0,
+  "greedy_mode": "W1",
+  "destroy_mode": "area",
+  "exact_time_limit": 120.0,
+  "exact_mip_gap": 0.02,
+  "score_exact": 243.45247337068997,
+  "score_LS": 243.45247337068992,
+  "score_DR": 243.45247337068992,
+  "time_exact": 2.1586612998507917,
+  "time_LS": 10.51914510014467,
+  "max_chargers_per_site": 5
+}

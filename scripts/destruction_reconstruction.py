@@ -64,21 +64,19 @@ def run_one_policy(
     D,
     forbid_self: bool = False,
     max_iter: int = 50,
-    # Step 1: Time-budget DR
     dr_time_limit: float = 300.0,
     dr_log_every: int = 1,
     exact_time_limit: float = 400,
     exact_mip_gap: float = 0.01,
     greedy_mode: str = "deterministic",
     destroy_mode: str = "area",
-    allow_multi_charger: bool = False,  # Step 7 switch
+    allow_multi_charger: bool = False,
+    max_chargers_per_site: int | None = None,
     seed: int | None = None,
 ):
     """
-    One run: (optional) exact baseline -> greedy init -> LS -> DR loop (time-budgeted).
-
-    Returns dict with:
-      scores/times + DR_log + optional solution comparison fields.
+    One run: exact baseline -> greedy init -> LS -> DR loop (time-budgeted).
+    Works for binary stations and integer chargers (single-period).
     """
     if seed is not None:
         np.random.seed(seed)
@@ -91,7 +89,7 @@ def run_one_policy(
         greedy_init_mode = "W2"
         greedy_recon_mode = "weighted_W2"
     elif greedy_mode == "deterministic":
-        greedy_init_mode = None
+        greedy_init_mode = "W1"  # for integer chargers, deterministic here is okay but W1 is a strong default
         greedy_recon_mode = "deterministic"
     else:
         raise ValueError(f"Unknown greedy_mode: {greedy_mode}")
@@ -106,7 +104,9 @@ def run_one_policy(
         coords_I, coords_J, D=D, forbid_self=forbid_self,
         I_idx=I_idx, J_idx=J_idx
     )
-    farther_of = compute_farther(distIJ, in_range, Ij)
+
+    # FIX: compute_farther expects Ji (i -> reachable j list)
+    farther_of = compute_farther(distIJ, in_range, Ji)
 
     # =================================================
     # 1) EXACT baseline
@@ -120,6 +120,7 @@ def run_one_policy(
             M, N, in_range, Ji, Ij, demand_I, Q, P,
             distIJ=distIJ, method_name=policy,
             allow_multi_charger=allow_multi_charger,
+            max_chargers_per_site=max_chargers_per_site,
         )
         t0 = time.perf_counter()
         res = solve_model(
@@ -140,20 +141,15 @@ def run_one_policy(
         M, N, in_range, Ji, Ij, demand_I, Q, P,
         distIJ=distIJ, method_name=policy,
         allow_multi_charger=allow_multi_charger,
+        max_chargers_per_site=max_chargers_per_site,
     )
 
     try:
-        if greedy_init_mode is not None:
-            m_greedy = build_initial_solution_weighted(
-                m0, distIJ, demand_I,
-                method_name=policy,
-                weight_mode=greedy_init_mode
-            )
-        else:
-            m_greedy = reconstruction_greedy(
-                m0, distIJ, demand_I, D,
-                method_name=policy, greedy_mode="deterministic"
-            )
+        m_greedy = build_initial_solution_weighted(
+            m0, distIJ, demand_I,
+            method_name=policy,
+            weight_mode=greedy_init_mode
+        )
     except Exception as e:
         print(f"⚠️ Greedy init failed, using base model: {e}")
         m_greedy = m0
@@ -183,10 +179,6 @@ def run_one_policy(
 
     score_LS = evaluate_solution(m_LS, distIJ, demand_I, method_name=policy)["covered_demand"]
 
-    # (optional safety) LS shouldn't beat exact if exact exists
-    if not np.isnan(score_exact):
-        score_LS = min(score_LS, score_exact)
-
     # =================================================
     # 4) DR init
     # =================================================
@@ -198,12 +190,11 @@ def run_one_policy(
     it = 0
 
     # =================================================
-    # 5) DR loop (time-budgeted) — Steps 1/2/3
+    # 5) DR loop (time-budgeted)
     # =================================================
     while (time.perf_counter() - start_DR) < dr_time_limit:
         it += 1
 
-        # choose k_remove schedule by mode
         dm = (destroy_mode or "random").lower()
         if dm in ("area", "cluster"):
             ratio = np.random.uniform(0.3, 0.7)
@@ -212,12 +203,15 @@ def run_one_policy(
         else:
             ratio = np.random.uniform(0.1, 0.9)
 
+        # Important:
+        #  - binary: k_remove is number of stations removed (<= P sites)
+        #  - integer: k_remove is number of chargers removed (<= total P chargers)
         k_remove = max(1, int(ratio * P))
 
-        # Step 2: ALWAYS clone best before mutation
+        # clone best before mutation
         m_ref = m_best.clone()
 
-        # destroy (Step 3 modes)
+        # destroy
         m_tmp = destroy_partial(
             m_ref,
             k_remove=k_remove,
@@ -253,12 +247,11 @@ def run_one_policy(
             best_score = new_score
             m_best = m_tmp
 
-        # log (dr_log_every)
         if (it % max(1, dr_log_every)) == 0:
             logger_dr.log(it, new_score, best_score, time.perf_counter() - start_DR, k_remove=k_remove, mode=destroy_mode)
 
     # =================================================
-    # 6) Side-by-side compare info (Step 4)
+    # 6) Side-by-side compare info
     # =================================================
     cmp_exact_best = None
     if m_exact is not None:
@@ -280,78 +273,4 @@ def run_one_policy(
         compare_exact_vs_best=cmp_exact_best,
         m_exact=m_exact,
         m_best=m_best,
-
     )
-
-
-def run_batch_one_pass(
-    Ns=(20,),
-    seeds=(1,),
-    policies=("closest_only", "closest_priority", "system_optimum", "uniform"),
-    greedy_mode="deterministic",
-    save_instances=True,
-    data_dir_small="data/small",
-    data_dir_large="data/large",
-    forbid_self=False,
-    max_iter=50,
-    exact_time_limit=120,
-    exact_mip_gap=0.02,
-    dr_time_limit=300.0,
-    dr_log_every=1,
-    destroy_mode="area",
-    allow_multi_charger=False,
-):
-    rows = []
-
-    for N in Ns:
-        folder = data_dir_small if N <= 100 else data_dir_large
-        Path(folder).mkdir(parents=True, exist_ok=True)
-
-        P, Q, D = default_parameters_for(N)
-
-        for seed in seeds:
-            inst_path = Path(folder) / f"inst_N{N}_seed{seed}.json"
-            if inst_path.exists():
-                inst = load_instance(inst_path)
-            else:
-                inst = generate_instance(N=N, seed=seed)
-                if save_instances:
-                    save_instance(inst, inst_path)
-
-            for policy in policies:
-                row = run_one_policy(
-                    inst,
-                    policy,
-                    P=P, Q=Q, D=D,
-                    forbid_self=forbid_self,
-                    max_iter=max_iter,
-                    exact_time_limit=exact_time_limit,
-                    exact_mip_gap=exact_mip_gap,
-                    greedy_mode=greedy_mode,
-                    destroy_mode=destroy_mode,
-                    dr_time_limit=dr_time_limit,
-                    dr_log_every=dr_log_every,
-                    allow_multi_charger=allow_multi_charger,
-                    seed=seed,
-                )
-                row["N"] = N
-                row["seed"] = seed
-                rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    # Safety: LS cannot exceed exact if exact exists
-    df["score_LS"] = df[["score_LS", "score_exact"]].min(axis=1)
-
-    # Gap (%)
-    df["Gap (%)"] = 100 * (df["score_LS"] - df["score_exact"]).abs() / df["score_exact"].replace(0, np.nan)
-
-    # Flat view
-    df_flat = df[[
-        "N", "seed", "policy",
-        "score_exact", "time_exact", "Gap (%)",
-        "score_greedy", "score_LS", "time_LS",
-        "score_DR",
-    ]].copy()
-
-    return df_flat, df  # df has DR_log + compare dicts

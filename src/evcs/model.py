@@ -13,18 +13,30 @@ from evcs.methods import apply_method, compute_farther
 def build_base_model(
     M, N, in_range, Ji, Ij, demand_I, Q, P,
     distIJ=None, method_name="none",
-    allow_multi_charger: bool = False
+    allow_multi_charger: bool = False,
+    max_chargers_per_site: int | None = None,
 ):
     """
     EVCS allocation model.
 
-    If allow_multi_charger=False:
-      x[j] is Binary, limit: sum x <= P   (P = number of stations)
+    Single-period.
 
-    If allow_multi_charger=True:
-      x[j] is NonNegativeIntegers, limit: sum x <= P (P = total modules/chargers)
-      y <= x still works because x>=1 means open.
-      capacity: sum demand*y <= Q*x
+    Case A) allow_multi_charger=False (binary stations)
+      - x[j] in {0,1}
+      - budget: sum_j x[j] <= P        (P = number of stations)
+      - capacity: sum_i a[i]*y[i,j] <= Q * x[j]
+
+    Case B) allow_multi_charger=True (integer chargers/modules)
+      - z[j] in {0,1}   (site open indicator)
+      - x[j] in Z_+     (number of chargers/modules at j)
+      - link: x[j] <= U * z[j]
+      - budget: sum_j x[j] <= P        (P = total chargers/modules)
+      - assignment open-link: y[i,j] <= z[j]
+      - capacity: sum_i a[i]*y[i,j] <= Q * x[j]
+
+    Notes:
+      - y[i,j] is continuous in [0,1]. If you want strict assignment, make it Binary.
+      - If you later add fixed + variable costs, z[j] becomes essential.
     """
     m = ConcreteModel()
 
@@ -35,38 +47,78 @@ def build_base_model(
 
     # --- Parameters ---
     m.a = Param(m.I, initialize={i: float(demand_I[i]) for i in range(M)}, within=NonNegativeReals)
+
+    # Q = capacity per charger/module (in "demand units")
     m.Q = Param(initialize=float(Q), within=NonNegativeReals, mutable=True)
-    m.P = Param(initialize=int(P), within=NonNegativeReals, mutable=True)
+
+    # P = budget (interpretation depends on allow_multi_charger)
+    # keep as integer-like
+    m.P = Param(initialize=int(P), within=NonNegativeIntegers, mutable=True)
+
+    # Upper bound on chargers per site (U)
+    # If not provided, a safe default is P (can't place more chargers at a site than total budget)
+    U = int(P) if max_chargers_per_site is None else int(max_chargers_per_site)
+    if U <= 0:
+        U = 0
+    m.U = Param(initialize=U, within=NonNegativeIntegers, mutable=True)
 
     # --- Decision Variables ---
     if allow_multi_charger:
-        m.x = Var(m.J, within=NonNegativeIntegers)   # number of chargers/modules at j
+        # z[j]=1 if site is used at all, x[j]=# chargers there
+        m.z = Var(m.J, within=Binary)
+        m.x = Var(m.J, within=NonNegativeIntegers, bounds=(0, U))
     else:
+        # x[j]=1 if site open
         m.x = Var(m.J, within=Binary)
 
+    # Assignment vars: fraction/assignment of demand i to station j (0..1)
     m.y = Var(m.Arcs, bounds=(0, 1))
 
-    # --- Default Objective: maximize coverage ---
+    # --- Objective: maximize covered demand ---
     def obj_rule(m):
         return sum(m.a[i] * m.y[i, j] for (i, j) in m.Arcs)
     m.obj = Objective(rule=obj_rule, sense=maximize)
 
     # --- Constraints ---
+    # Each demand point assigned at most once
     def demand_once(m, i):
         return sum(m.y[i, j] for j in Ji.get(i, [])) <= 1
     m.demand_once = Constraint(m.I, rule=demand_once)
 
-    def open_link(m, i, j):
-        return m.y[i, j] <= m.x[j]
-    m.open_link = Constraint(m.Arcs, rule=open_link)
+    # Link assignment to open site
+    if allow_multi_charger:
+        def open_link(m, i, j):
+            return m.y[i, j] <= m.z[j]
+        m.open_link = Constraint(m.Arcs, rule=open_link)
 
-    def capacity_rule(m, j):
-        return sum(m.a[i] * m.y[i, j] for i in Ij.get(j, [])) <= m.Q * m.x[j]
-    m.capacity = Constraint(m.J, rule=capacity_rule)
+        # Link chargers to open indicator: x[j] <= U*z[j]
+        def charger_link(m, j):
+            return m.x[j] <= m.U * m.z[j]
+        m.charger_link = Constraint(m.J, rule=charger_link)
 
-    def limit_rule(m):
-        return sum(m.x[j] for j in m.J) <= m.P
-    m.limit = Constraint(rule=limit_rule)
+        # Capacity scales with charger count
+        def capacity_rule(m, j):
+            return sum(m.a[i] * m.y[i, j] for i in Ij.get(j, [])) <= m.Q * m.x[j]
+        m.capacity = Constraint(m.J, rule=capacity_rule)
+
+        # Budget is total chargers/modules
+        def limit_rule(m):
+            return sum(m.x[j] for j in m.J) <= m.P
+        m.limit = Constraint(rule=limit_rule)
+
+    else:
+        # Binary case: y <= x
+        def open_link(m, i, j):
+            return m.y[i, j] <= m.x[j]
+        m.open_link = Constraint(m.Arcs, rule=open_link)
+
+        def capacity_rule(m, j):
+            return sum(m.a[i] * m.y[i, j] for i in Ij.get(j, [])) <= m.Q * m.x[j]
+        m.capacity = Constraint(m.J, rule=capacity_rule)
+
+        def limit_rule(m):
+            return sum(m.x[j] for j in m.J) <= m.P
+        m.limit = Constraint(rule=limit_rule)
 
     # --- Apply policy-specific logic ---
     if str(method_name).lower() not in ["none", "base"]:
