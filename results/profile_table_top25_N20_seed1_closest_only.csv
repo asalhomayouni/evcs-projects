@@ -1,5 +1,5 @@
 cumtime (s),cumtime (% of total),tottime (s),tottime (% of total),ncalls,function,location
-61.588,100.0,0.005,0.008,1,run_one_policy,destruction_reconstruction.py:59
+61.588,100,0.005,0.008,1,run_one_policy,destruction_reconstruction.py:59
 60.428,98.117,0.092,0.149,60,local_search,methods.py:346
 48.676,79.035,3.154,5.121,31126,reassign_y,methods.py:359
 27.063,43.943,6.574,10.673,16511859,__contains__,set.py:536
