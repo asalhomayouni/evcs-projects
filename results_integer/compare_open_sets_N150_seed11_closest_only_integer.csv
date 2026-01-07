@@ -1,0 +1,9 @@
+metric,value
+n_exact_open,11
+n_best_open,12
+n_common,10
+only_exact,[9]
+only_best,"[34, 36]"
+common,"[13, 18, 44, 54, 67, 85, 100, 115, 117, 144]"
+total_units_exact,11
+total_units_best,12

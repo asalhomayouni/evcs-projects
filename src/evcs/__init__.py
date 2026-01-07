@@ -9,4 +9,5 @@ from .methods import (
     evaluate_solution,
 )
 
+
 from .solve import solve_model

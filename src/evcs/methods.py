@@ -397,6 +397,7 @@ def local_search(model, distIJ, in_range, Ji, Ij, farther_of,
             model.x[j_to].value = charger_count(model, j_to) - 1
 
         # Main loop: first improvement by default
+        # Main loop: first improvement by default
         for it in range(max_iter):
             improved = False
 
@@ -414,7 +415,6 @@ def local_search(model, distIJ, in_range, Ji, Ij, farther_of,
                     old_from = charger_count(model, j_from)
                     old_to   = charger_count(model, j_to)
 
-                    # Try moving 1 charger, then 2 chargers (stronger move)
                     for K in (1, 2):
                         if old_from < K:
                             continue
@@ -441,11 +441,15 @@ def local_search(model, distIJ, in_range, Ji, Ij, farther_of,
 
                     if improved:
                         break
-
                 if improved:
                     break
 
+            # ✅ THIS LINE WAS MISSING
+            if not improved:
+                break
+
         return model
+
 
     # -----------------------------
     # Binary LS (your original style)

@@ -47,14 +47,18 @@ class DRLogger:
             "destroy_mode": self.mode,
         })
 
-
-def default_parameters_for(N: int):
+def default_parameters_binary(N):
     P = max(2, int(round((N ** 0.5) / 1.2)))
     avg_demand = 3.0
     Q = (N * avg_demand) / max(1, P)
-    D = 3.5 if N <= 60 else 2.8
+    D = 3.5 if N <= 60 else 2.0
     return P, Q, D
 
+def default_parameters_integer(N):
+    P_sites, Q, _ = default_parameters_binary(N)
+    P_chargers = int(1.2 * P_sites)
+    D = 1.5
+    return P_chargers, Q, D
 
 def run_one_policy(
     inst,
