@@ -126,3 +126,149 @@ def build_base_model(
         m = apply_method(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
 
     return m
+
+
+from pyomo.environ import ConstraintList  # add at top if not already
+
+def build_multi_period_model(
+    M, N, T, in_range, Ji, Ij,
+    demand_IT,          # shape: [T][M] or dict {(i,t): val}
+    Q, P_T,             # P_T: list/array length T (budget per period)
+    distIJ=None, method_name="none",
+    allow_multi_charger: bool = True,
+    max_chargers_per_site: int | None = None,
+    cumulative_install: bool = True,
+):
+    """
+    Multi-period EVCS allocation model.
+
+    Interpretation:
+      - u[j,t] = new chargers installed at site j in period t (integer >= 0)
+      - x[j,t] = chargers available (installed) at site j in period t (integer >= 0)
+      - z[j,t] = open indicator in period t (binary)
+      - y[i,j,t] = assignment fraction in period t
+
+    Dynamics (if cumulative_install=True):
+      x[j,0] = u[j,0]
+      x[j,t] = x[j,t-1] + u[j,t]    (chargers persist over time)
+
+    Budget:
+      sum_j u[j,t] <= P_T[t]   for each period t
+
+    Notes:
+      - This is designed to NOT interfere with build_base_model().
+      - You can still apply your policies; we’ll add apply_method_multi() in methods.py.
+    """
+    from evcs.methods import apply_method_multi, compute_farther  # local import to avoid circular issues
+
+    m = ConcreteModel()
+
+    # --- Sets ---
+    m.I = Set(initialize=range(M))
+    m.J = Set(initialize=range(N))
+    m.T = Set(initialize=range(T))
+    m.Arcs = Set(dimen=2, initialize=in_range)
+
+    # --- Parameters ---
+    # Demand a[i,t]
+    if isinstance(demand_IT, dict):
+        a_init = {(i, t): float(demand_IT[(i, t)]) for t in range(T) for i in range(M)}
+    else:
+        # assume list/np array like demand_IT[t][i]
+        a_init = {(i, t): float(demand_IT[t][i]) for t in range(T) for i in range(M)}
+    m.a = Param(m.I, m.T, initialize=a_init, within=NonNegativeReals)
+
+    m.Q = Param(initialize=float(Q), within=NonNegativeReals, mutable=True)
+
+    # Period budgets
+    if not hasattr(P_T, "__len__"):
+        raise ValueError("P_T must be a list/array of length T (budget per period).")
+    if len(P_T) != T:
+        raise ValueError(f"P_T length must be T={T}, got {len(P_T)}")
+    m.P = Param(m.T, initialize={t: int(P_T[t]) for t in range(T)}, within=NonNegativeIntegers, mutable=True)
+
+    # Upper bound per site
+    U = int(max(P_T)) if max_chargers_per_site is None else int(max_chargers_per_site)
+    if U < 0:
+        U = 0
+    m.U = Param(initialize=U, within=NonNegativeIntegers, mutable=True)
+
+    # --- Decision variables ---
+    # Recommend multi-charger for multi-period
+    if not allow_multi_charger:
+        # You CAN model binary stations per period, but it’s usually not what you want for installation planning.
+        # Kept here for completeness.
+        m.x = Var(m.J, m.T, within=Binary)
+        m.y = Var(m.Arcs, m.T, bounds=(0, 1))
+    else:
+        m.u = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, U))  # new installs
+        m.x = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, U))  # installed/available
+        m.z = Var(m.J, m.T, within=Binary)                               # open indicator
+        m.y = Var(m.Arcs, m.T, bounds=(0, 1))
+
+    # --- Objective: maximize total covered demand (sum over time) ---
+    def obj_rule(m):
+        return sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+    m.obj = Objective(rule=obj_rule, sense=maximize)
+
+    # --- Constraints ---
+    # Each demand point assigned at most once per period
+    def demand_once(m, i, t):
+        return sum(m.y[i, j, t] for j in Ji.get(i, [])) <= 1
+    m.demand_once = Constraint(m.I, m.T, rule=demand_once)
+
+    if not allow_multi_charger:
+        # Binary-per-period case
+        def open_link(m, i, j, t):
+            return m.y[i, j, t] <= m.x[j, t]
+        m.open_link = Constraint(m.Arcs, m.T, rule=open_link)
+
+        def capacity_rule(m, j, t):
+            return sum(m.a[i, t] * m.y[i, j, t] for i in Ij.get(j, [])) <= m.Q * m.x[j, t]
+        m.capacity = Constraint(m.J, m.T, rule=capacity_rule)
+
+        # Budget each period (how many sites open in each period)
+        def limit_rule(m, t):
+            return sum(m.x[j, t] for j in m.J) <= m.P[t]
+        m.limit = Constraint(m.T, rule=limit_rule)
+
+    else:
+        # Link assignment to open site
+        def open_link(m, i, j, t):
+            return m.y[i, j, t] <= m.z[j, t]
+        m.open_link = Constraint(m.Arcs, m.T, rule=open_link)
+
+        # Link chargers to open indicator
+        def charger_link(m, j, t):
+            return m.x[j, t] <= m.U * m.z[j, t]
+        m.charger_link = Constraint(m.J, m.T, rule=charger_link)
+
+        # Capacity scales with chargers in that period
+        def capacity_rule(m, j, t):
+            return sum(m.a[i, t] * m.y[i, j, t] for i in Ij.get(j, [])) <= m.Q * m.x[j, t]
+        m.capacity = Constraint(m.J, m.T, rule=capacity_rule)
+
+        # Installation dynamics
+        if cumulative_install:
+            def dyn(m, j, t):
+                if t == 0:
+                    return m.x[j, t] == m.u[j, t]
+                return m.x[j, t] == m.x[j, t-1] + m.u[j, t]
+            m.dyn = Constraint(m.J, m.T, rule=dyn)
+        else:
+            # If you want independent x each period (no persistence), force x=u
+            def dyn(m, j, t):
+                return m.x[j, t] == m.u[j, t]
+            m.dyn = Constraint(m.J, m.T, rule=dyn)
+
+        # Budget is installs per period
+        def limit_rule(m, t):
+            return sum(m.u[j, t] for j in m.J) <= m.P[t]
+        m.limit = Constraint(m.T, rule=limit_rule)
+
+    # --- Apply policy-specific logic (multi-period aware) ---
+    if str(method_name).lower() not in ["none", "base"]:
+        farther_of = compute_farther(distIJ, in_range, Ji) if distIJ is not None else {}
+        m = apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
+
+    return m

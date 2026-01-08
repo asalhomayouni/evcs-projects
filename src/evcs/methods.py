@@ -43,6 +43,18 @@ def charger_count(m, j) -> int:
         return 0
     return int(round(float(xj)))
 
+def open_value_t(m, j, t) -> float:
+    if hasattr(m, "z"):
+        return float(m.z[j, t].value or 0.0)
+    # binary-per-period
+    return float(m.x[j, t].value or 0.0)
+
+def charger_count_t(m, j, t) -> int:
+    xjt = m.x[j, t].value
+    if xjt is None:
+        return 0
+    return int(round(float(xjt)))
+
 
 def total_chargers(m) -> int:
     return sum(charger_count(m, j) for j in m.J)
@@ -63,6 +75,28 @@ def evaluate_solution(m, distIJ, demand_I, method_name="closest_only"):
 
     return {"covered_demand": obj_val, "covered_pct": cov_pct}
 
+from pyomo.environ import value
+
+def evaluate_solution_multi(m, demand_IT):
+    """
+    Returns total covered demand across all periods.
+    demand_IT can be [T][M] or dict {(i,t): val}.
+    """
+    obj_val = float(value(m.obj))
+
+    # compute coverage percent (optional)
+    if isinstance(demand_IT, dict):
+        total_demand = sum(float(demand_IT[(i, t)]) for t in m.T for i in m.I)
+        cov_term = sum(float(demand_IT[(i, t)]) * float(m.y[i, j, t].value or 0.0)
+                       for (i, j) in m.Arcs for t in m.T)
+    else:
+        T = len(demand_IT)
+        total_demand = sum(float(demand_IT[t][i]) for t in range(T) for i in m.I)
+        cov_term = sum(float(demand_IT[t][i]) * float(m.y[i, j, t].value or 0.0)
+                       for (i, j) in m.Arcs for t in m.T for i in [i])
+
+    cov_pct = 100.0 * cov_term / total_demand if total_demand > 0 else 0.0
+    return {"covered_demand": obj_val, "covered_pct": cov_pct}
 
 # =========================================================
 # Policy definitions (updated for multi-charger using z)
@@ -168,6 +202,78 @@ def apply_method(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=F
     m.obj = Objective(expr=expr_cov, sense=maximize)
     return m
 
+from pyomo.environ import ConstraintList, Objective, maximize
+
+def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=False):
+    """
+    Multi-period wrapper: repeats the policy constraints for each period t.
+    If model has no m.T, fallback to existing apply_method().
+    """
+    if not hasattr(m, "T"):
+        return apply_method(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=verbose)
+
+    name = str(method_name).lower()
+
+    # Helper to reset objective
+    def set_cov_obj():
+        if hasattr(m, "obj"):
+            m.del_component("obj")
+        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        m.obj = Objective(expr=expr_cov, sense=maximize)
+
+    if name == "uniform":
+        # uniform per period: y[i,j,t] = frac * open(j,t)
+        if hasattr(m, "obj"):
+            m.del_component("obj")
+        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        m.obj = Objective(expr=expr_cov, sense=maximize)
+
+        m.uniform_alloc = ConstraintList()
+        for t in m.T:
+            for i in m.I:
+                reach = [j for j in m.J if (i, j) in m.Arcs]
+                if not reach:
+                    continue
+                frac = 1.0 / len(reach)
+                for j in reach:
+                    if hasattr(m, "z"):
+                        m.uniform_alloc.add(m.y[i, j, t] == frac * m.z[j, t])
+                    else:
+                        m.uniform_alloc.add(m.y[i, j, t] == frac * m.x[j, t])
+        return m
+
+    if name == "closest_only":
+        m.closest_only = ConstraintList()
+        for t in m.T:
+            for (i, j), farther in farther_of.items():
+                if hasattr(m, "z"):
+                    m.closest_only.add(sum(m.y[ii, jj, t] for (ii, jj) in farther) <= 1 - m.z[j, t])
+                else:
+                    m.closest_only.add(sum(m.y[ii, jj, t] for (ii, jj) in farther) <= 1 - m.x[j, t])
+        set_cov_obj()
+        return m
+
+    if name == "closest_priority":
+        # coverage + tiny tie-break by distance, per period
+        if hasattr(m, "obj"):
+            m.del_component("obj")
+        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        expr_tie = sum((1.0 - distIJ[i][j]) * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        m.obj = Objective(expr=expr_cov + 1e-3 * expr_tie, sense=maximize)
+        return m
+
+    if name == "system_optimum":
+        if hasattr(m, "obj"):
+            m.del_component("obj")
+        lambda_dist = 0.1
+        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        expr_dist = sum(distIJ[i][j] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+        m.obj = Objective(expr=expr_cov - lambda_dist * expr_dist, sense=maximize)
+        return m
+
+    # default
+    set_cov_obj()
+    return m
 
 # =========================================================
 # Core reassignment used by greedy + LS (updated for integer chargers)
@@ -220,6 +326,49 @@ def reassign_y_greedy(m, distIJ, Ji, method_name: str):
     sync_open_indicator(m)
     return m
 
+def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str):
+    """
+    Period-by-period greedy assignment.
+    Same idea as reassign_y_greedy(), but for y[i,j,t] and a[i,t].
+    """
+    I = sorted({i for i, _ in m.Arcs})
+    J = sorted({j for _, j in m.Arcs})
+    Tset = sorted(list(m.T))
+    Q = float(m.Q.value)
+
+    # clear y
+    for (ii, jj) in m.Arcs:
+        for t in Tset:
+            m.y[ii, jj, t].value = 0.0
+
+    for t in Tset:
+        a = {i: float(m.a[i, t]) for i in I}
+        cap_rem = {j: Q * float(charger_count_t(m, j, t)) for j in J}
+        open_sites = {j for j in J if open_value_t(m, j, t) > 0.5}
+
+        for i in I:
+            reachable = list(Ji.get(i, []))
+            if not reachable:
+                continue
+
+            if method_name == "uniform":
+                open_reach = [j for j in reachable if j in open_sites]
+                if not open_reach:
+                    continue
+                frac = 1.0 / len(open_reach)
+                for j in open_reach:
+                    m.y[i, j, t].value = frac
+            else:
+                open_reach = [j for j in reachable if j in open_sites]
+                if not open_reach:
+                    continue
+                for j in sorted(open_reach, key=lambda jj: distIJ[i][jj]):
+                    if cap_rem[j] >= a[i] - 1e-9:
+                        m.y[i, j, t].value = 1.0
+                        cap_rem[j] -= a[i]
+                        break
+
+    return m
 
 # =========================================================
 # Greedy Initializers (updated)
