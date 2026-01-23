@@ -410,9 +410,12 @@ def reassign_y_greedy(m, distIJ, Ji, method_name: str):
             continue
 
         if method_name == "uniform":
-            frac = 1.0 / len(open_reach)
-            for j in open_reach:
-                m.y[i, j].value = frac
+            # Binary-uniform: pick one feasible open site (random)
+            j = random.choice(open_reach)
+            if cap_rem[j] >= a[i] - 1e-9:
+                m.y[i, j].value = 1.0
+                cap_rem[j] -= a[i]
+
         else:
             for j in sorted(open_reach, key=lambda jj: distIJ[i][jj]):
                 if cap_rem[j] >= a[i] - 1e-9:
@@ -424,10 +427,14 @@ def reassign_y_greedy(m, distIJ, Ji, method_name: str):
     return m
 
 
+import random
+
 def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install: bool = True):
     """
-    Multi-period greedy assignment.
-    Robust fix: rebuild Ji_int from m.Arcs to avoid key-type mismatches.
+    Multi-period greedy assignment (BINARY y).
+    - y[i,j,t] is set to 0/1 only
+    - each demand i at time t assigned to at most one open site
+    - capacity: sum_i a[i,t] * y[i,j,t] <= Q * x[j,t]
     """
     sync_solution_state(m, cumulative_install=cumulative_install)
 
@@ -442,18 +449,24 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
         ii, jj = int(i), int(j)
         Ji_int.setdefault(ii, []).append(jj)
 
-    # Clear y
+    # --- Clear y (binary) ---
     for (i, j) in m.Arcs:
         ii, jj = int(i), int(j)
         for t in T_list:
             tt = int(t)
-            m.y[ii, jj, tt].value = 0.0
+            m.y[ii, jj, tt].value = 0
 
+    # --- Assign per period ---
     for t in T_list:
         tt = int(t)
 
+        # period demand
         a = {int(i): float(m.a[i, t]) for i in I_list}
+
+        # remaining capacity at each site for this period
         cap_rem = {int(j): Q * float(charger_count_t(m, j, t)) for j in J_list}
+
+        # open sites this period
         open_sites = {int(j) for j in J_list if open_value_t(m, j, t) > 0.5}
 
         for i in I_list:
@@ -466,25 +479,27 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
             if not open_reach:
                 continue
 
+            # ---- IMPORTANT: uniform must be binary too ----
             if method_name == "uniform":
-                frac = 1.0 / len(open_reach)
-                for jj in open_reach:
-                    m.y[ii, jj, tt].value = frac
+                # pick one feasible open site (random), but must have enough remaining capacity
+                feasible = [jj for jj in open_reach if cap_rem[jj] >= a[ii] - 1e-9]
+                if not feasible:
+                    continue
+                chosen = random.choice(feasible)
+                m.y[ii, chosen, tt].value = 1
+                cap_rem[chosen] -= a[ii]
             else:
-                remaining = 1.0
+                # closest-first among feasible
+                chosen = None
                 for jj in sorted(open_reach, key=lambda jjj: distIJ[ii][jjj]):
-                    if remaining <= 1e-12:
+                    if cap_rem[jj] >= a[ii] - 1e-9:
+                        chosen = jj
                         break
-                    if cap_rem[jj] <= 1e-12:
-                        continue
 
-                    # how much of i can station jj serve?
-                    take = min(remaining, cap_rem[jj] / max(a[ii], 1e-12))
-                    if take > 1e-12:
-                        m.y[ii, jj, tt].value = take
-                        cap_rem[jj] -= a[ii] * take
-                        remaining -= take
-
+                if chosen is not None:
+                    m.y[ii, chosen, tt].value = 1
+                    cap_rem[chosen] -= a[ii]
+                # else: leave unassigned (allowed by <=1 constraint)
 
     return m
 

@@ -16,28 +16,7 @@ def build_base_model(
     allow_multi_charger: bool = False,
     max_chargers_per_site: int | None = None,
 ):
-    """
-    EVCS allocation model.
-
-    Single-period.
-
-    Case A) allow_multi_charger=False (binary stations)
-      - x[j] in {0,1}
-      - budget: sum_j x[j] <= P        (P = number of stations)
-      - capacity: sum_i a[i]*y[i,j] <= Q * x[j]
-
-    Case B) allow_multi_charger=True (integer chargers/modules)
-      - z[j] in {0,1}   (site open indicator)
-      - x[j] in Z_+     (number of chargers/modules at j)
-      - link: x[j] <= U * z[j]
-      - budget: sum_j x[j] <= P        (P = total chargers/modules)
-      - assignment open-link: y[i,j] <= z[j]
-      - capacity: sum_i a[i]*y[i,j] <= Q * x[j]
-
-    Notes:
-      - y[i,j] is continuous in [0,1]. If you want strict assignment, make it Binary.
-      - If you later add fixed + variable costs, z[j] becomes essential.
-    """
+   
     m = ConcreteModel()
 
     # --- Sets ---
@@ -71,8 +50,9 @@ def build_base_model(
         # x[j]=1 if site open
         m.x = Var(m.J, within=Binary)
 
-    # Assignment vars: fraction/assignment of demand i to station j (0..1)
-    m.y = Var(m.Arcs, bounds=(0, 1))
+    # Binary assignment (each demand chooses at most one station)
+    m.y = Var(m.Arcs, within=Binary)
+
 
     # --- Objective: maximize covered demand ---
     def obj_rule(m):
@@ -139,26 +119,7 @@ def build_multi_period_model(
     max_chargers_per_site: int | None = None,
     cumulative_install: bool = True,
 ):
-    """
-    Multi-period EVCS allocation model.
-
-    Interpretation:
-      - u[j,t] = new chargers installed at site j in period t (integer >= 0)
-      - x[j,t] = chargers available (installed) at site j in period t (integer >= 0)
-      - z[j,t] = open indicator in period t (binary)
-      - y[i,j,t] = assignment fraction in period t
-
-    Dynamics (if cumulative_install=True):
-      x[j,0] = u[j,0]
-      x[j,t] = x[j,t-1] + u[j,t]    (chargers persist over time)
-
-    Budget:
-      sum_j u[j,t] <= P_T[t]   for each period t
-
-    Notes:
-      - This is designed to NOT interfere with build_base_model().
-      - You can still apply your policies; we’ll add apply_method_multi() in methods.py.
-    """
+    
     from evcs.methods import apply_method_multi, compute_farther  # local import to avoid circular issues
 
     m = ConcreteModel()
@@ -199,12 +160,14 @@ def build_multi_period_model(
         # You CAN model binary stations per period, but it’s usually not what you want for installation planning.
         # Kept here for completeness.
         m.x = Var(m.J, m.T, within=Binary)
-        m.y = Var(m.Arcs, m.T, bounds=(0, 1))
+        m.y = Var(m.Arcs, m.T, within=Binary)
+
     else:
         m.u = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, U))  # new installs
         m.x = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, U))  # installed/available
         m.z = Var(m.J, m.T, within=Binary)                               # open indicator
-        m.y = Var(m.Arcs, m.T, bounds=(0, 1))
+        m.y = Var(m.Arcs, m.T, within=Binary)
+
 
     # --- Objective: maximize total covered demand (sum over time) ---
     def obj_rule(m):

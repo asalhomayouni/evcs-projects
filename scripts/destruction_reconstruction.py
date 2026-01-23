@@ -317,8 +317,8 @@ def run_one_policy_multi(
     seed: int | None = None,
     verbose: bool = False,
     # NEW knobs to weaken greedy (good for DR curve)
-    greedy_topk: int = 10,
-    greedy_noise: float = 0.15,
+    greedy_topk: int = 1.0,
+    greedy_noise: float = 0.0,
 ):
     """
     Multi-period baseline runner (Priority-1/2):
@@ -354,6 +354,65 @@ def run_one_policy_multi(
         coords_I, coords_J, D=D, forbid_self=forbid_self
     )
 
+    def _extract_mip_gap_and_bound(res, sense: str = "max"):
+        """
+        Returns (gap, best_bound, incumbent_obj) if available, else (None, None, None).
+
+        sense: "max" or "min" (your model is MAX covered_demand)
+        """
+        gap = None
+        best_bound = None
+        incumbent = None
+
+        # 1) Try direct fields (rarely works, but cheap)
+        try:
+            gap = getattr(res.solver, "mip_gap", None)
+            if gap is None:
+                gap = getattr(res.solver, "gap", None)
+        except Exception:
+            pass
+
+        # 2) Try solver backend model (common for Gurobi / persistent interfaces)
+        sm = None
+        try:
+            sm = getattr(res.solver, "_solver_model", None)
+        except Exception:
+            sm = None
+
+        # ---- GUROBI ----
+        if sm is not None:
+            try:
+                if hasattr(sm, "MIPGap"):
+                    gap = float(sm.MIPGap)
+                if hasattr(sm, "ObjBound"):
+                    best_bound = float(sm.ObjBound)
+                if hasattr(sm, "ObjVal"):
+                    incumbent = float(sm.ObjVal)
+            except Exception:
+                pass
+
+            # ---- CPLEX (sometimes) ----
+            try:
+                # some CPLEX objects expose relative gap via solution.MIP
+                if gap is None and hasattr(sm, "solution") and hasattr(sm.solution, "MIP"):
+                    gap = float(sm.solution.MIP.get_mip_relative_gap())
+                if best_bound is None and hasattr(sm, "solution") and hasattr(sm.solution, "MIP"):
+                    best_bound = float(sm.solution.MIP.get_best_objective())
+            except Exception:
+                pass
+
+        # 3) If we have bound + incumbent but no gap, compute it
+        if gap is None and (best_bound is not None) and (incumbent is not None):
+            denom = max(1.0, abs(incumbent))
+            if sense.lower().startswith("max"):
+                # for MAX: bound >= incumbent
+                gap = max(0.0, (best_bound - incumbent) / denom)
+            else:
+                # for MIN: incumbent >= bound
+                gap = max(0.0, (incumbent - best_bound) / denom)
+
+        return gap, best_bound, incumbent
+
     # -------------------------
     # EXACT (time-limited)
     # -------------------------
@@ -363,6 +422,9 @@ def run_one_policy_multi(
     exact_termination = None
     proven_optimal_exact = None
     exact_gap = None
+    exact_bound = None
+    exact_incumbent_obj = None
+
 
     try:
         m_exact = build_multi_period_model(
@@ -398,12 +460,8 @@ def run_one_policy_multi(
         proven_optimal_exact = (tc == TerminationCondition.optimal)
 
         # gap (solver-dependent; may be None)
-        try:
-            exact_gap = getattr(res.solver, "mip_gap", None)
-            if exact_gap is None:
-                exact_gap = getattr(res.solver, "gap", None)
-        except Exception:
-            exact_gap = None
+        exact_gap, exact_bound, exact_incumbent_obj = _extract_mip_gap_and_bound(res, sense="max")
+
 
         score_exact = float(evaluate_solution_multi(m_exact, demand_IT)["covered_demand"])
 
@@ -411,6 +469,7 @@ def run_one_policy_multi(
         if verbose:
             print("Exact failed:", e)
 
+    
     # -------------------------
     # GREEDY schedule + greedy assign
     # -------------------------
@@ -494,7 +553,6 @@ def run_one_policy_multi(
         time_exact=time_exact,
         exact_termination=exact_termination,
         proven_optimal_exact=proven_optimal_exact,
-        exact_gap=exact_gap,
         score_greedy=score_greedy,
         time_greedy=time_greedy,
         m_exact=m_exact,
@@ -503,6 +561,9 @@ def run_one_policy_multi(
         Ji=Ji,
         Ij=Ij,
         in_range=in_range,
+        exact_gap=exact_gap,
+        exact_bound=exact_bound,
+        exact_incumbent_obj=exact_incumbent_obj,
     )
 
 
@@ -528,15 +589,20 @@ def _apply_u_matrix(m, Udict):
             m.u[j, t].value = int(Udict.get((jj, tt), 0))
 
 
+import numpy as np
+
 def destroy_multi_u(
     Udict,
     P_T,
     frac_remove: float = 0.20,
-    mode: str = "k_units",          # NEW defaults to strong destroy
+    mode: str = "k_units",
     seed: int | None = None,
 ):
     """
     Strong destroy operators on Udict only.
+
+    Returns:
+        (U_new, k_removed)
 
     modes:
       - "k_units": remove k units globally (k ~ frac_remove * total_u)
@@ -548,57 +614,93 @@ def destroy_multi_u(
         np.random.seed(seed)
 
     mode = (mode or "k_units").lower()
-    keys = list(Udict.keys())
-    if not keys:
-        return Udict
 
-    total = sum(int(v) for v in Udict.values())
+    # IMPORTANT: work on a COPY (do NOT mutate input)
+    U_new = dict(Udict)
+
+    keys = list(U_new.keys())
+    if not keys:
+        return U_new, 0
+
+    total = sum(int(v) for v in U_new.values())
     if total <= 0:
-        return Udict
+        return U_new, 0
 
     # infer sets
-    Js = sorted({j for (j, t) in Udict.keys()})
-    Ts = sorted({t for (j, t) in Udict.keys()})
+    Js = sorted({j for (j, t) in U_new.keys()})
+    Ts = sorted({t for (j, t) in U_new.keys()})
 
     # ---------- site_all ----------
     if mode in ("site_all", "site"):
-        j_star = int(np.random.choice(Js))
+        # choose only sites that currently have at least 1 unit somewhere
+        candidates = []
+        for j in Js:
+            totj = sum(int(U_new[(int(j), int(t))]) for t in Ts)
+            if totj > 0:
+                candidates.append(int(j))
+
+        if not candidates:
+            return U_new, 0
+
+        j_star = int(np.random.choice(candidates))
+        before = sum(int(U_new[(j_star, int(t))]) for t in Ts)
         for t in Ts:
-            Udict[(j_star, int(t))] = 0
-        return Udict
+            U_new[(j_star, int(t))] = 0
+        return U_new, before
+
 
     # ---------- site_future ----------
     if mode in ("site_future", "future"):
-        j_star = int(np.random.choice(Js))
+        # choose only sites that have some units
+        candidates = []
+        for j in Js:
+            totj = sum(int(U_new[(int(j), int(t))]) for t in Ts)
+            if totj > 0:
+                candidates.append(int(j))
+
+        if not candidates:
+            return U_new, 0
+
+        j_star = int(np.random.choice(candidates))
         t0 = int(np.random.choice(Ts))
+
+        before = sum(int(U_new[(j_star, int(t))]) for t in Ts if int(t) >= t0)
+        if before <= 0:
+            return U_new, 0
+
         for t in Ts:
             if int(t) >= t0:
-                Udict[(j_star, int(t))] = 0
-        return Udict
+                U_new[(j_star, int(t))] = 0
+        return U_new, before
+
 
     # decide k for unit-based destroys
     if mode in ("k_units", "k"):
-        k_remove = max(2, int(round(frac_remove * total)))
+        k_remove = max(1, int(np.ceil(frac_remove * total)))
+
     else:
         # "random_unit" (old weak behavior)
-        k_remove = max(1, int(round(frac_remove * total)))
+        k_remove = max(1, int(np.ceil(frac_remove * total)))
+
 
     k_remove = min(k_remove, total)
 
-    donors = [k for k, v in Udict.items() if int(v) > 0]
+    donors = [k for k, v in U_new.items() if int(v) > 0]
     if not donors:
-        return Udict
+        return U_new, 0
 
-    weights = np.array([max(1e-12, float(Udict[k])) for k in donors], dtype=float)
+    weights = np.array([max(1e-12, float(U_new[k])) for k in donors], dtype=float)
     weights /= weights.sum()
 
+    removed = 0
     for _ in range(k_remove):
         idx = int(np.random.choice(len(donors), p=weights))
         key = donors[idx]
-        if Udict[key] > 0:
-            Udict[key] -= 1
+        if U_new[key] > 0:
+            U_new[key] -= 1
+            removed += 1
 
-    return Udict
+    return U_new, removed
 
 
 
@@ -715,13 +817,16 @@ def run_DR_multi(
     seed: int | None = None,
     verbose: bool = False,
     accept_epsilon: float = 0.02,
-
 ):
     """
-    Priority-2 multi-period DR:
-      - start from greedy schedule+assign (your baseline)
-      - iterate: destroy u -> reconstruct u (greedy) -> assign y -> evaluate
-      - accept only improving solutions (best-improvement tracking)
+    Multi-period DR:
+      - start from greedy schedule+assign (baseline)
+      - iterate: destroy u -> reconstruct (greedy) -> evaluate
+      - keep BOTH:
+          * current state (walk state)   : (U_curr, score_curr)
+          * best-so-far (incumbent best) : (U_best, m_best, best_score)
+      - accept if not much worse than current (epsilon)
+      - update best only on strict improvement
       - log DR curve
     """
     if seed is not None:
@@ -735,7 +840,7 @@ def run_DR_multi(
     # arcs
     distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D, forbid_self=False)
 
-    # Build a template model (no solving)
+    # template model (no solving)
     m_template = build_multi_period_model(
         M=M, N=N, T=T,
         in_range=in_range, Ji=Ji, Ij=Ij,
@@ -746,9 +851,11 @@ def run_DR_multi(
     )
 
     farther_of = compute_farther(distIJ, in_range, Ji)
-    m_template = apply_method_multi(m_template, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
+    m_template = apply_method_multi(
+        m_template, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False
+    )
 
-    # --- initial = greedy baseline from your run_one_policy_multi ---
+    # --- initial = greedy baseline ---
     base_out = run_one_policy_multi(
         inst=inst, policy=policy, P_T=P_T, Q=Q, D=D, T=T,
         exact_time_limit=exact_time_limit, exact_mip_gap=exact_mip_gap,
@@ -756,71 +863,105 @@ def run_DR_multi(
         cumulative_install=cumulative_install,
         seed=seed, verbose=verbose
     )
-    m_best = base_out["m_best"]
-    best_score = evaluate_solution_multi(m_best, demand_IT)["covered_demand"]
 
+    m0 = base_out["m_best"]
+    score0 = evaluate_solution_multi(m0, demand_IT)["covered_demand"]
+
+    # current (walk state)
+    U_curr = _clone_u_matrix(m0)
+    score_curr = score0
+
+    # best-so-far (incumbent)
+    U_best = dict(U_curr)
+    m_best = m0
+    best_score = score0
+
+    # logging
     logger = DRLogger()
     t_start = time.perf_counter()
+
     seen = set()
     def hash_u(Ud):
         return tuple(Ud[k] for k in sorted(Ud.keys()))
 
-    # store as u-dict (solution vector)
-    U_best = _clone_u_matrix(m_best)
-    seen.add(hash_u(U_best))
+    seen.add(hash_u(U_curr))
 
     it = 0
     while it < max_iter and (time.perf_counter() - t_start) < dr_time_limit:
         it += 1
 
-        # 1) destroy (on a copy)
-        U_try = dict(U_best)
-        U_try = destroy_multi_u(
-            U_try, P_T=P_T, frac_remove=frac_remove, mode=destroy_mode,
-            seed=None if seed is None else (seed + it)
+        # 1) destroy CURRENT (not best), returns (U_try, k_removed)
+        # iteration-dependent seed (or None)
+        seed_iter = None if seed is None else (seed + it)
+
+        U_try, k_removed = destroy_multi_u(
+            U_curr,
+            P_T,
+            frac_remove=frac_remove,
+            mode=destroy_mode,
+            seed=seed_iter,     # <<< FIX
         )
 
-        # 2) reconstruct + assign
-        m_try = reconstruct_multi_u_greedy(
-            m_template=m_template,
-            Udict_partial=U_try,
-            distIJ=distIJ,
-            demand_IT=demand_IT,
-            P_T=P_T,
-            policy=policy,
-            cumulative_install=cumulative_install,
-        )
 
-        # 3) evaluate
-        score_try = evaluate_solution_multi(m_try, demand_IT)["covered_demand"]
+        # uniqueness count for the tried solution
+        seen.add(hash_u(U_try))
+        unique_count = len(seen)
 
-        # 4) accept if improved
-        accepted = False
+        # 2) reconstruct K times → keep the best
+        # 2) reconstruct K times -> keep best (no reseed here)
+        K = 8
+        best_local_score = -1e18
+        best_local_m = None
+        best_local_U = None
 
-        # accept to move on plateaus (epsilon)
-        if score_try >= best_score - float(accept_epsilon):
-            accepted = True
-            # move current point (for next destroy)
-            U_best = _clone_u_matrix(m_try)
+        for r in range(K):
+            m_tmp = reconstruct_multi_u_greedy(
+                m_template=m_template,
+                Udict_partial=dict(U_try),   # fresh copy every time
+                distIJ=distIJ,
+                demand_IT=demand_IT,
+                P_T=P_T,
+                policy=policy,
+                cumulative_install=cumulative_install,
+            )
+            s_tmp = evaluate_solution_multi(m_tmp, demand_IT)["covered_demand"]
 
-            # but best-so-far only updates on strict improvement
+            if s_tmp > best_local_score:
+                best_local_score = s_tmp
+                best_local_m = m_tmp
+                best_local_U = _clone_u_matrix(m_tmp)
+
+        m_try = best_local_m
+        score_try = best_local_score
+        U_try = best_local_U
+
+
+        # 4) acceptance rule (epsilon-worse allowed relative to CURRENT)
+        accepted = (score_try >= score_curr - float(accept_epsilon))
+
+        if accepted:
+            # move the walk
+            U_curr = _clone_u_matrix(m_try)
+            score_curr = score_try
+            seen.add(hash_u(U_curr))  # current is also visited
+
+            # update incumbent best only on strict improvement
             if score_try > best_score + 1e-9:
                 best_score = score_try
                 m_best = m_try
+                U_best = dict(U_curr)
 
-        # 5) log curve
-        seen.add(hash_u(U_best))
+        # 5) log
         logger.log(
             it=it,
             score=score_try,
             best=best_score,
             elapsed=time.perf_counter() - t_start,
-            k_remove=None,                 # optional: you can compute it
+            k_remove=k_removed,
             mode=destroy_mode,
             accepted=accepted,
-            unique=len(seen),
+            unique=unique_count,
         )
-
 
     return dict(
         policy=policy,
@@ -830,4 +971,3 @@ def run_DR_multi(
         m_best=m_best,
         distIJ=distIJ,
     )
-
