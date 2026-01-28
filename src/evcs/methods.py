@@ -435,15 +435,21 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
     - y[i,j,t] is set to 0/1 only
     - each demand i at time t assigned to at most one open site
     - capacity: sum_i a[i,t] * y[i,j,t] <= Q * x[j,t]
+    
+    Strong greedy:
+      - assigns i in descending demand order (per period)
+      - uses Best-Fit among feasible open sites (fills capacity tightly)
+      - uniform remains random among FEASIBLE open sites
     """
+    import random
     sync_solution_state(m, cumulative_install=cumulative_install)
 
-    I_list = list(m.I)
-    J_list = list(m.J)
-    T_list = list(m.T)
+    I_list = [int(i) for i in m.I]
+    J_list = [int(j) for j in m.J]
+    T_list = [int(t) for t in m.T]
     Q = float(m.Q.value)
 
-    # --- Rebuild Ji with int keys from Arcs (guaranteed consistent) ---
+    # --- Rebuild adjacency from Arcs (int keys) ---
     Ji_int = {}
     for (i, j) in m.Arcs:
         ii, jj = int(i), int(j)
@@ -452,25 +458,24 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
     # --- Clear y (binary) ---
     for (i, j) in m.Arcs:
         ii, jj = int(i), int(j)
-        for t in T_list:
-            tt = int(t)
+        for tt in T_list:
             m.y[ii, jj, tt].value = 0
 
     # --- Assign per period ---
-    for t in T_list:
-        tt = int(t)
-
+    for tt in T_list:
         # period demand
-        a = {int(i): float(m.a[i, t]) for i in I_list}
+        a = {ii: float(m.a[ii, tt]) for ii in I_list}
 
         # remaining capacity at each site for this period
-        cap_rem = {int(j): Q * float(charger_count_t(m, j, t)) for j in J_list}
+        cap_rem = {jj: Q * float(charger_count_t(m, jj, tt)) for jj in J_list}
 
         # open sites this period
-        open_sites = {int(j) for j in J_list if open_value_t(m, j, t) > 0.5}
+        open_sites = {jj for jj in J_list if open_value_t(m, jj, tt) > 0.5}
 
-        for i in I_list:
-            ii = int(i)
+        # STRONG: assign high-demand nodes first
+        I_sorted = sorted(I_list, key=lambda ii: a[ii], reverse=True)
+
+        for ii in I_sorted:
             reachable = Ji_int.get(ii, [])
             if not reachable:
                 continue
@@ -479,29 +484,28 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
             if not open_reach:
                 continue
 
-            # ---- IMPORTANT: uniform must be binary too ----
-            if method_name == "uniform":
-                # pick one feasible open site (random), but must have enough remaining capacity
-                feasible = [jj for jj in open_reach if cap_rem[jj] >= a[ii] - 1e-9]
-                if not feasible:
-                    continue
-                chosen = random.choice(feasible)
-                m.y[ii, chosen, tt].value = 1
-                cap_rem[chosen] -= a[ii]
-            else:
-                # closest-first among feasible
-                chosen = None
-                for jj in sorted(open_reach, key=lambda jjj: distIJ[ii][jjj]):
-                    if cap_rem[jj] >= a[ii] - 1e-9:
-                        chosen = jj
-                        break
+            # only keep feasible by remaining capacity
+            feasible = [jj for jj in open_reach if cap_rem[jj] >= a[ii] - 1e-9]
+            if not feasible:
+                continue
 
-                if chosen is not None:
-                    m.y[ii, chosen, tt].value = 1
-                    cap_rem[chosen] -= a[ii]
-                # else: leave unassigned (allowed by <=1 constraint)
+            if method_name == "uniform":
+                # random among feasible (still binary)
+                chosen = random.choice(feasible)
+
+            else:
+                # STRONG: Best-Fit (min remaining capacity after placing ii)
+                # tie-break by distance
+                chosen = min(
+                    feasible,
+                    key=lambda jj: (cap_rem[jj] - a[ii], distIJ[ii][jj])
+                )
+
+            m.y[ii, chosen, tt].value = 1
+            cap_rem[chosen] -= a[ii]
 
     return m
+
 
 
 # =========================================================

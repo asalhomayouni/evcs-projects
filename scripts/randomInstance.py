@@ -11,9 +11,18 @@ def generate_instance(
     demand_low=1.0,
     demand_high=5.0,
     seed=DEFAULT_SEED,
-    T=None,                    # NEW: number of periods (optional)
-    demand_pattern="flat",      # NEW: "flat" | "trend_up" | "trend_down" | "seasonal"
-    period_noise=0.05,          # NEW: small randomness per period
+    T=None,                     # number of periods (optional)
+    demand_pattern="flat",       # "flat" | "trend_up" | "trend_down" | "seasonal"
+    period_noise=0.05,           # small randomness per period
+
+    # ----------------------------
+    # NEW: harder demand controls
+    # ----------------------------
+    demand_dist="uniform",       # "uniform" | "lognormal"
+    lognorm_sigma=1.0,           # tail heaviness (0.6 mild, 1.0 strong, 1.4 very heavy)
+    n_hotspots=0,                # 0 disables hotspots; typical 1-5
+    hotspot_strength=4.0,        # how strong hotspots are (e.g., 2-8)
+    hotspot_radius=1.5,          # spatial radius in same units as coords
 ):
     rng = np.random.default_rng(seed)
     xmin, xmax, ymin, ymax = area
@@ -21,7 +30,39 @@ def generate_instance(
     xs = rng.uniform(xmin, xmax, size=N)
     ys = rng.uniform(ymin, ymax, size=N)
     coords = np.vstack([xs, ys]).T
-    demand = rng.uniform(demand_low, demand_high, size=N)
+
+    # ----------------------------
+    # Base demand: uniform vs lognormal (heavy-tailed)
+    # ----------------------------
+    if str(demand_dist).lower() == "lognormal":
+        raw = rng.lognormal(mean=0.0, sigma=float(lognorm_sigma), size=N)
+        raw = raw / max(1e-12, raw.mean())  # normalize mean to 1
+        scale = rng.uniform(demand_low, demand_high)
+        demand = raw * scale
+    else:
+        demand = rng.uniform(demand_low, demand_high, size=N)
+
+    # ----------------------------
+    # Static spatial hotspots (do NOT move over time)
+    # ----------------------------
+    if int(n_hotspots) > 0:
+        K = min(int(n_hotspots), N)
+        center_idx = rng.choice(N, size=K, replace=False)
+        centers = coords[center_idx]  # (K,2)
+
+        boost = np.ones(N, dtype=float)
+        r = float(hotspot_radius)
+        s = float(hotspot_strength)
+
+        # Gaussian bump around each hotspot center
+        for c in centers:
+            dist = np.sqrt(((coords - c) ** 2).sum(axis=1))
+            boost += s * np.exp(-(dist ** 2) / (2.0 * r * r))
+
+        demand = demand * boost
+
+    # (optional) clip nonnegative
+    demand = np.clip(demand, 0.0, None)
 
     I_idx = list(range(N))
     J_idx = list(range(N))
@@ -36,7 +77,14 @@ def generate_instance(
             area=area,
             demand_low=demand_low,
             demand_high=demand_high,
-            timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+
+            # NEW meta (useful for reproducibility)
+            demand_dist=str(demand_dist),
+            lognorm_sigma=float(lognorm_sigma) if str(demand_dist).lower() == "lognormal" else None,
+            n_hotspots=int(n_hotspots),
+            hotspot_strength=float(hotspot_strength) if int(n_hotspots) > 0 else None,
+            hotspot_radius=float(hotspot_radius) if int(n_hotspots) > 0 else None,
         ),
         location_df=df,
         coords=coords,
@@ -48,7 +96,7 @@ def generate_instance(
     )
 
     # ----------------------------
-    # Multi-period demand optional
+    # Multi-period demand optional (STATIC hotspots: only global time factor + noise)
     # ----------------------------
     if T is not None:
         base = demand.astype(float)
@@ -60,7 +108,6 @@ def generate_instance(
         elif demand_pattern == "trend_down":
             factors = np.linspace(1.0, 0.7, T)
         elif demand_pattern == "seasonal":
-            # simple seasonality around 1.0
             factors = 1.0 + 0.2 * np.sin(np.linspace(0, 2*np.pi, T, endpoint=False))
         else:
             raise ValueError("demand_pattern must be flat|trend_up|trend_down|seasonal")
@@ -69,11 +116,12 @@ def generate_instance(
         for t in range(T):
             noise = rng.normal(0.0, period_noise, size=N)
             d_t = base * factors[t] * (1.0 + noise)
-            d_t = np.clip(d_t, 0.0, None)   # keep nonnegative
+            d_t = np.clip(d_t, 0.0, None)
             demand_IT.append(d_t.astype(float))
 
         inst["meta"]["T"] = int(T)
         inst["meta"]["demand_pattern"] = demand_pattern
+        inst["meta"]["period_noise"] = float(period_noise)
         inst["demand_IT"] = demand_IT
 
     return inst
@@ -110,11 +158,10 @@ def save_instance(inst, out_path):
             for t in range(len(inst["demand_IT"]))
         ]
 
-
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
-    # Optional: CSV
+    # Optional: CSV (single-period demand only; you can extend if you want)
     csv_path = out_path.with_suffix(".csv")
     df = pd.DataFrame(inst["coords"], columns=["x", "y"])
     df["demand"] = inst["demand_I"]
@@ -133,6 +180,8 @@ def load_instance(in_path):
     with open(in_path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
+    demand_IT = None
+
     # -----------------------------------------------------
     # NEW FORMAT
     # -----------------------------------------------------
@@ -150,7 +199,6 @@ def load_instance(in_path):
 
         meta = payload.get("meta", {})
 
-        demand_IT = None
         if "demand_IT" in payload["nodes"]:
             demand_IT = [
                 np.array([float(payload["nodes"]["demand_IT"][t][str(i)]) for i in range(len(coords))], dtype=float)
@@ -169,7 +217,10 @@ def load_instance(in_path):
 
         meta = payload.get("meta", {})
 
-    # Build DataFrame
+        # Old format might have demand_IT directly
+        if "demand_IT" in payload:
+            demand_IT = [np.array(x, dtype=float) for x in payload["demand_IT"]]
+
     df = pd.DataFrame(coords, columns=["x", "y"])
     df["type"] = ""
 
@@ -188,7 +239,6 @@ def load_instance(in_path):
     return inst
 
 
-
 # =========================================================
 # CLI (optional)
 # =========================================================
@@ -200,5 +250,14 @@ if __name__ == "__main__":
     ap.add_argument("--out", type=str, default="evcs-projects/data/random_instances/inst_N{N}_seed{seed}.json")
     args = ap.parse_args()
 
-    inst = generate_instance(N=args.N, seed=args.seed)
+    inst = generate_instance(
+        N=args.N,
+        seed=args.seed,
+        # Example harder settings (edit as you like):
+        demand_dist="lognormal",
+        lognorm_sigma=1.0,
+        n_hotspots=3,
+        hotspot_strength=5.0,
+        hotspot_radius=1.2,
+    )
     save_instance(inst, args.out.format(N=args.N, seed=args.seed))
