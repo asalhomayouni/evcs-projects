@@ -1196,4 +1196,5 @@ def run_DR_multi(
         DR_batches=pd.DataFrame(batch_logs),  # per-window table
         m_best=m_best,
         distIJ=distIJ,
+        DR_batches=pd.DataFrame(batch_logs),
     )
