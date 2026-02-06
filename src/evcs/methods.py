@@ -507,6 +507,282 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
     return m
 
 
+# =========================================================
+# Simplified Greedy Initializers (FAST variants A–E)
+# =========================================================
+import numpy as np
+
+def _pairwise_dist(A, B):
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+    diff = A[:, None, :] - B[None, :, :]
+    return np.sqrt(np.sum(diff * diff, axis=2))
+
+def _precompute_greedy_tables(coords_I, coords_J, demand_I, D_cover, Rp_penalty=None):
+    """
+    Precompute:
+      - base score S0(j) = sum demand within D_cover of site j
+      - neighbor lists within Rp_penalty for fast penalty updates
+    """
+    coords_I = np.asarray(coords_I, dtype=float)
+    coords_J = np.asarray(coords_J, dtype=float)
+    demand_I = np.asarray(demand_I, dtype=float)
+
+    Rp = D_cover if Rp_penalty is None else float(Rp_penalty)
+
+    # Demand-in-range scoring: S0(j)
+    D_JI = _pairwise_dist(coords_J, coords_I)              # (|J|,|I|)
+    cover_mask = (D_JI <= float(D_cover))
+    S0 = cover_mask @ demand_I                              # (|J|,)
+
+    # Neighbors within Rp for local updates
+    D_JJ = _pairwise_dist(coords_J, coords_J)              # (|J|,|J|)
+    neighbors = [np.where(D_JJ[j] <= Rp)[0] for j in range(len(coords_J))]
+    dist_neighbors = [D_JJ[j, neighbors[j]] for j in range(len(coords_J))]
+
+    return S0, neighbors, dist_neighbors, Rp
+
+def greedy_init_simple_variants(
+    inst,
+    B,
+    D_cover,
+    variant="ring",          # "ring" | "exp" | "tabu" | "additive" | "topk_random"
+    Rp_penalty=None,
+    gamma=0.5,               # strength (ring/exp/tabu)
+    tau=None,                # exp decay length (required for exp)
+    cooldown_steps=2,        # tabu cooldown
+    beta=0.10,               # additive penalty strength
+    topK=5,                  # for topk_random (and can be used for any variant)
+    seed=0,
+):
+    """
+    Returns:
+      x: np.array shape (|J|,) integer chargers per site (single-period initializer)
+
+    Uses only:
+      inst["coords_I"], inst["coords_J"], inst["demand_I"]
+    """
+    coords_I = inst["coords_I"]
+    coords_J = inst["coords_J"]
+    demand_I = inst["demand_I"]
+
+    rng = np.random.default_rng(seed)
+
+    S0, neighbors, dist_neighbors, Rp = _precompute_greedy_tables(
+        coords_I, coords_J, demand_I, D_cover, Rp_penalty=Rp_penalty
+    )
+
+    m = len(coords_J)
+    x = np.zeros(m, dtype=int)
+    S = S0.copy()
+
+    cooldown = np.zeros(m, dtype=int)
+
+    def pick_site():
+        # tabu mask
+        mask = (cooldown <= 0)
+        if not np.any(mask):
+            mask = np.ones(m, dtype=bool)
+
+        scores = S.copy()
+        scores[~mask] = -np.inf
+
+        # topK randomized selection (Variant E style)
+        if variant == "topk_random":
+            k = min(int(topK), np.sum(np.isfinite(scores)))
+            if k <= 1:
+                return int(np.nanargmax(scores))
+            idx = np.argpartition(scores, -k)[-k:]
+            idx = idx[np.isfinite(scores[idx])]
+            return int(rng.choice(idx))
+
+        # (optional) you can ALSO add topK randomness to other variants:
+        # if topK is not None and topK > 1: ... (kept simple for now)
+
+        j_star = int(np.nanargmax(scores))
+        if not np.isfinite(scores[j_star]):
+            j_star = int(rng.integers(0, m))
+        return j_star
+
+    def penalty_ring(j_star):
+        nb = neighbors[j_star]
+        S[nb] *= (1.0 - float(gamma))
+
+    def penalty_exp(j_star):
+        if tau is None or tau <= 0:
+            raise ValueError("variant='exp' requires tau > 0")
+        nb = neighbors[j_star]
+        d = dist_neighbors[j_star]
+        factor = 1.0 - float(gamma) * np.exp(-d / float(tau))
+        factor = np.clip(factor, 0.0, 1.0)
+        S[nb] *= factor
+
+    def penalty_additive(j_star):
+        nb = neighbors[j_star]
+        dec = float(beta) * float(S0[j_star])
+        S[nb] = np.maximum(0.0, S[nb] - dec)
+
+    for _ in range(int(B)):
+        j_star = pick_site()
+        x[j_star] += 1
+
+        # update cooldown
+        if variant == "tabu":
+            cooldown = np.maximum(0, cooldown - 1)
+            nb = neighbors[j_star]
+            cooldown[nb] = np.maximum(cooldown[nb], int(cooldown_steps))
+            # optionally also ring-penalize:
+            penalty_ring(j_star)
+
+        elif variant == "ring":
+            penalty_ring(j_star)
+
+        elif variant == "exp":
+            penalty_exp(j_star)
+
+        elif variant == "additive":
+            penalty_additive(j_star)
+
+        elif variant == "topk_random":
+            penalty_ring(j_star)   # topK selection + ring penalty (fast & effective)
+
+        else:
+            raise ValueError(f"Unknown variant: {variant}")
+
+    return x
+
+def greedy_schedule_multi_from_variants(
+    inst,
+    P_T,
+    D_cover,
+    variant="ring",          # ring | exp | tabu | additive | topk_random
+    gamma=0.5,
+    tau=None,
+    cooldown_steps=3,
+    beta=0.10,
+    topK=5,
+    seed=0,
+    cumulative_install=True,
+    U=None,                  # max chargers per site (cap), optional
+    mode="aggregate_then_fill",  # aggregate_then_fill | per_period
+):
+    """
+    Build an initial multi-period install schedule u[j,t] using FAST greedy variants.
+
+    Returns:
+      U0: dict {(j,t): int} for j in [0..N-1], t in [0..T-1], with sum_j u[j,t] == P_T[t]
+          (unless limited by U caps; then it will fill as much as possible)
+
+    Notes:
+      - If mode="aggregate_then_fill": build one spatial x_target using sum_t demand, then distribute across periods.
+      - If mode="per_period": run variant greedy independently each period using demand_IT[t] and budget P_T[t].
+      - Enforces per-period budgets P_T.
+      - If U is not None, enforces x[j,t] <= U (cumulative or not).
+    """
+    demand_IT = inst["demand_IT"]
+    coords_J = inst["coords_J"]
+    T = len(P_T)
+    N = len(coords_J)
+
+    # initialize schedule dict
+    U0 = {(j, t): 0 for j in range(N) for t in range(T)}
+
+    # helper to compute current x(j,t) from U0
+    def x_from_U0(j, t):
+        if not cumulative_install:
+            return int(U0[(j, t)])
+        return sum(int(U0[(j, tt)]) for tt in range(t + 1))
+
+    if mode == "per_period":
+        # Each period independently uses that period's demand and P_T[t]
+        for t in range(T):
+            inst_t = {
+                "coords_I": inst["coords_I"],
+                "coords_J": inst["coords_J"],
+                "demand_I": demand_IT[t],
+            }
+            x_t = greedy_init_simple_variants(
+                inst_t,
+                B=int(P_T[t]),
+                D_cover=D_cover,
+                variant=variant,
+                gamma=gamma,
+                tau=tau,
+                cooldown_steps=cooldown_steps,
+                beta=beta,
+                topK=topK,
+                seed=(seed or 0) + 1000 * t,
+            ).astype(int)
+
+            # write as installs in this period, with optional U cap
+            for j in range(N):
+                add = int(x_t[j])
+                if add <= 0:
+                    continue
+
+                # If U cap exists, restrict add so that x(j,t) <= U
+                if U is not None:
+                    cur_x = x_from_U0(j, t)
+                    add = max(0, min(add, int(U) - cur_x))
+
+                U0[(j, t)] += add
+
+        # NOTE: per_period might not hit exactly P_T[t] if U caps restrict it.
+        return U0
+
+    # -------------------------
+    # aggregate_then_fill (default)
+    # -------------------------
+
+    # 1) aggregate demand over time
+    d_agg = np.sum(np.array(demand_IT, dtype=float), axis=0)  # shape (M,)
+
+    inst_agg = {
+        "coords_I": inst["coords_I"],
+        "coords_J": inst["coords_J"],
+        "demand_I": d_agg,
+    }
+
+    # 2) total chargers over horizon
+    B_total = int(sum(P_T))
+
+    # 3) spatial plan x_target (final total chargers per site)
+    x_target = greedy_init_simple_variants(
+        inst_agg,
+        B=B_total,
+        D_cover=D_cover,
+        variant=variant,
+        gamma=gamma,
+        tau=tau,
+        cooldown_steps=cooldown_steps,
+        beta=beta,
+        topK=topK,
+        seed=seed or 0,
+    ).astype(int)
+
+    remaining = x_target.copy()
+
+    # 4) distribute into periods respecting P_T and optional U cap
+    for t in range(T):
+        cap = int(P_T[t])
+        while cap > 0 and remaining.sum() > 0:
+            j = int(np.argmax(remaining))
+            if remaining[j] <= 0:
+                remaining[j] = 0
+                continue
+
+            # enforce U cap if provided
+            if U is not None:
+                cur_x = x_from_U0(j, t)
+                if cur_x >= int(U):
+                    remaining[j] = 0
+                    continue
+
+            U0[(j, t)] += 1
+            remaining[j] -= 1
+            cap -= 1
+
+    return U0
 
 # =========================================================
 # Initial solution helper (kept; minimal cleanup)

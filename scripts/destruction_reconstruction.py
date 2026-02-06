@@ -7,7 +7,6 @@ from pyomo.opt import TerminationCondition
 from evcs.geom import build_arcs
 from evcs.model import build_base_model ,build_multi_period_model
 from evcs.methods import (
-    build_initial_solution_weighted,
     reconstruction_greedy,
     local_search,
     evaluate_solution,
@@ -18,6 +17,9 @@ from evcs.methods import (
     reassign_y_greedy_multi,
     evaluate_solution_multi,
     sync_solution_state,
+    greedy_init_simple_variants,
+    greedy_schedule_multi_from_variants,
+
 )
 from evcs.solve import solve_model
 
@@ -160,13 +162,32 @@ def run_one_policy(
     )
 
     try:
-        m_greedy = build_initial_solution_weighted(
-            m0, distIJ, demand_I,
-            method_name=policy,
-            weight_mode=greedy_init_mode
+        x_init = greedy_init_simple_variants(
+            inst,
+            B=P,              # total chargers budget (if P is total chargers)
+            D_cover=D,        # your coverage distance
+            variant=greedy_init_mode,  # map your mode string to variants
+            gamma=0.5,
+            tau=0.6*D,
+            cooldown_steps=3,
+            beta=0.10,
+            topK=5,
+            seed=seed,
         )
+
+        m_greedy = m0
+
+        # Write x and z
+        for j in range(N):
+            m_greedy.x[j].value = int(x_init[j])
+            m_greedy.z[j].value = 1 if x_init[j] > 0 else 0
+
+        # Optional: build y assignment (if your evaluation expects y)
+        # If you already have a greedy assign function:
+        # reassign_y_greedy(m_greedy, distIJ, demand_I, Q, D, ...)
+
     except Exception as e:
-        print(f"⚠️ Greedy init failed, using base model: {e}")
+        print(f"⚠️ Simplified greedy init failed, using base model: {e}")
         m_greedy = m0
 
     score_greedy = evaluate_solution(m_greedy, distIJ, demand_I, method_name=policy)["covered_demand"]
@@ -304,6 +325,7 @@ def run_one_policy_multi(
     cumulative_install: bool = True,
     seed: int | None = None,
     verbose: bool = False,
+    greedy_variant="ring",
 ):
     import time
     import numpy as np
@@ -464,49 +486,39 @@ def run_one_policy_multi(
 
     t0 = time.perf_counter()
 
+
     # =========================
-    # STRONG GREEDY SCHEDULING (marginal uncovered demand, capacity-aware update)
+    # FAST GREEDY SCHEDULING (variant-based) via helper
     # =========================
-    for t in range(T):
-        uncovered = set(range(len(demand_IT[t])))
 
-        for _ in range(int(P_T[t])):
-            scored = []
-            for j in m_g.J:
-                if x_now(j, t) >= U:
-                    continue
+    # choose variant (you can pass this in as an argument instead of hardcoding)
+    greedy_variant = "ring"   # ring | exp | tabu | additive | topk_random
 
-                score = sum(
-                    float(demand_IT[t][i])
-                    for i in Ij_int.get(int(j), [])
-                    if int(i) in uncovered
-                )
-                scored.append((score, int(j)))
+    U_cap = int(m_g.U.value) if hasattr(m_g, "U") else (
+        int(max_chargers_per_site) if max_chargers_per_site is not None else None
+    )
 
-            if not scored:
-                break
+    U0 = greedy_schedule_multi_from_variants(
+        inst=inst,
+        P_T=P_T,
+        D_cover=D,
+        variant=greedy_variant,
+        gamma=0.5,
+        tau=0.6 * D,
+        cooldown_steps=3,
+        beta=0.10,
+        topK=5,
+        seed=seed or 0,
+        cumulative_install=cumulative_install,
+        U=U_cap,
+        mode="aggregate_then_fill",   # or "per_period"
+    )
 
-            scored.sort(reverse=True, key=lambda x: x[0])
-            best_score, best_j = scored[0]
+    # write schedule into model
+    for (j, t), val in U0.items():
+        m_g.u[j, t].value = int(val)
 
-            if best_score <= 1e-12:
-                break
-
-            m_g.u[best_j, t].value = int(m_g.u[best_j, t].value or 0) + 1
-
-            # capacity-aware uncovered update (remove only what one charger can serve)
-            cap = Q
-            reach_nodes = [int(i) for i in Ij_int.get(int(best_j), []) if int(i) in uncovered]
-            reach_nodes.sort(key=lambda i: float(demand_IT[t][i]), reverse=True)
-
-            used = 0.0
-            for i in reach_nodes:
-                di = float(demand_IT[t][i])
-                if used + di <= cap + 1e-9:
-                    uncovered.discard(i)
-                    used += di
-
-    # sync x/z from u then assign y
+    # sync x/z from u then assign y (KEEP YOUR EXISTING CODE)
     sync_solution_state(m_g, cumulative_install=cumulative_install)
     m_g = reassign_y_greedy_multi(m_g, distIJ, Ji, method_name=policy, cumulative_install=cumulative_install)
 
@@ -533,35 +545,6 @@ def run_one_policy_multi(
         exact_bound=exact_bound,
         exact_incumbent_obj=exact_incumbent_obj,
     )
-
-    # sync x/z from u then assign y
-    sync_solution_state(m_g, cumulative_install=cumulative_install)
-    m_g = reassign_y_greedy_multi(m_g, distIJ, Ji, method_name=policy, cumulative_install=cumulative_install)
-
-    score_greedy = float(evaluate_solution_multi(m_g, demand_IT)["covered_demand"])
-    time_greedy = time.perf_counter() - t0
-
-    return dict(
-        policy=policy,
-        T=T,
-        P_T=list(P_T),
-        score_exact=score_exact,
-        time_exact=time_exact,
-        exact_termination=exact_termination,
-        proven_optimal_exact=proven_optimal_exact,
-        score_greedy=score_greedy,
-        time_greedy=time_greedy,
-        m_exact=m_exact,
-        m_best=m_g,
-        distIJ=distIJ,
-        Ji=Ji,
-        Ij=Ij,
-        in_range=in_range,
-        exact_gap=exact_gap,
-        exact_bound=exact_bound,
-        exact_incumbent_obj=exact_incumbent_obj,
-    )
-
 
 # =========================================================
 # Priority-2: Multi-period DR (Destroy / Reconstruct / Loop)
@@ -589,23 +572,48 @@ def _apply_u_matrix(m, Udict):
 
 import numpy as np
 
+import numpy as np
+
 def destroy_multi_u(
     Udict,
+    inst,
+    rng,
     P_T,
     frac_remove: float = 0.20,
-    mode: str = "k_units",
+    mode: str = "site_swap",
     seed: int | None = None,
-    site_cap: int | None = None,          # NEW
-    cumulative_install: bool = True,      # NEW
+    site_cap: int | None = None,
+    cumulative_install: bool = True,
+    area_radius: float | None = None,
+    area_quantile: float = 0.25,
+    local_mix=(0.50, 0.25, 0.25),  # k_units, site_all, site_future
 ):
+    """
+    Destroy operator for multi-period installs Udict[(j,t)].
 
+    Inputs:
+      - Udict: dict {(j,t): int installs} for all j in J, t in T
+      - inst: must contain "coords_J"
+      - rng: np.random.Generator (preferred); if seed given, we create a local rng
+      - P_T: list length T (not directly used here, but kept for interface consistency)
+      - mode: "site_swap" | "local_remove" | "area_destroy"
+      - site_cap: max chargers at a site (cap)
+      - cumulative_install:
+          True  => cap applies to cumulative sum across all periods at that site
+          False => cap applies to per-period installs
+
+    Returns:
+      - U_new: new dict (copy) after destruction
+      - k_removed: int number of installs removed (site_swap moves, so k_removed=0)
+    """
+    # Local RNG if seed provided (do NOT touch global np.random)
     if seed is not None:
-        np.random.seed(seed)
+        rng = np.random.default_rng(int(seed))
 
-    mode = (mode or "k_units").lower()
+    mode = (mode or "site_swap").lower().strip()
 
-    # IMPORTANT: work on a COPY (do NOT mutate input)
-    U_new = dict(Udict)
+    # Work on a COPY (do NOT mutate input)
+    U_new = {k: int(v) for k, v in Udict.items()}
 
     keys = list(U_new.keys())
     if not keys:
@@ -618,155 +626,153 @@ def destroy_multi_u(
     # infer sets
     Js = sorted({int(j) for (j, t) in U_new.keys()})
     Ts = sorted({int(t) for (j, t) in U_new.keys()})
+    T_max = max(Ts) if Ts else 0
 
-    # ---------- site_all ----------
-    if mode in ("site_all", "site"):
-        candidates = []
-        for j in Js:
-            totj = sum(int(U_new[(j, t)]) for t in Ts)
-            if totj > 0:
-                candidates.append(j)
+    # helpers
+    def tot_by_j():
+        return {j: sum(int(U_new[(j, t)]) for t in Ts) for j in Js}
 
-        if not candidates:
-            return U_new, 0
+    def cum_in_site(j, t):
+        """cumulative installs at site j up to period t (inclusive), based on U_new."""
+        return sum(int(U_new[(j, tt)]) for tt in Ts if int(tt) <= int(t))
 
-        j_star = int(np.random.choice(candidates))
-        before = sum(int(U_new[(j_star, t)]) for t in Ts)
-        for t in Ts:
-            U_new[(j_star, t)] = 0
-        return U_new, before
-
-    # ---------- site_future ----------
-    if mode in ("site_future", "future"):
-        candidates = []
-        for j in Js:
-            totj = sum(int(U_new[(j, t)]) for t in Ts)
-            if totj > 0:
-                candidates.append(j)
-
-        if not candidates:
-            return U_new, 0
-
-        j_star = int(np.random.choice(candidates))
-        t0 = int(np.random.choice(Ts))
-
-        before = sum(int(U_new[(j_star, t)]) for t in Ts if t >= t0)
-        if before <= 0:
-            return U_new, 0
-
-        for t in Ts:
-            if t >= t0:
-                U_new[(j_star, t)] = 0
-        return U_new, before
-
-    # ---------- site_swap ----------
+    # ---------------------------------------------------------
+    # 1) SITE SWAP  (move schedule from one open site to another)
+    # ---------------------------------------------------------
     if mode in ("site_swap", "swap"):
-        # totals per site
-        tot_by_j = {j: sum(int(U_new[(j, t)]) for t in Ts) for j in Js}
-
-        open_sites = [j for j, totj in tot_by_j.items() if totj > 0]
+        totj = tot_by_j()
+        open_sites = [j for j, v in totj.items() if v > 0]
         if not open_sites:
             return U_new, 0
 
-        closed_sites = [j for j, totj in tot_by_j.items() if totj == 0]
+        closed_sites = [j for j, v in totj.items() if v == 0]
 
-        j_out = int(np.random.choice(open_sites))
+        j_out = int(rng.choice(open_sites))
 
-        # choose j_in != j_out, prefer closed site
+        # choose j_in != j_out, prefer closed
         if closed_sites:
-            closed_no_out = [j for j in closed_sites if j != j_out]
-            if closed_no_out:
-                j_in = int(np.random.choice(closed_no_out))
-            else:
-                # all closed sites equals j_out (rare); fallback
+            cand = [j for j in closed_sites if j != j_out]
+            if not cand:
                 cand = [j for j in Js if j != j_out]
-                if not cand:
-                    return U_new, 0
-                j_in = int(np.random.choice(cand))
         else:
             cand = [j for j in Js if j != j_out]
-            if not cand:
-                return U_new, 0
-            j_in = int(np.random.choice(cand))
 
-        before = sum(int(U_new[(j_out, t)]) for t in Ts)
-        if before <= 0:
+        if not cand:
             return U_new, 0
 
-        # If no cap enforcement requested, move everything period-by-period
-        if site_cap is None:
-            for t in Ts:
-                v = int(U_new[(j_out, t)])
-                if v > 0:
-                    U_new[(j_in, t)] = int(U_new[(j_in, t)]) + v
-                    U_new[(j_out, t)] = 0
-            return U_new, before
+        j_in = int(rng.choice(cand))
 
-        # With cap enforcement
-        Ts_sorted = sorted(Ts)
-
-        if cumulative_install:
-            # enforce cumulative capacity at j_in across periods
-            cum_in = 0
-            for t in Ts_sorted:
-                cum_in += int(U_new[(j_in, t)])
-                v = int(U_new[(j_out, t)])
-                if v <= 0:
-                    U_new[(j_out, t)] = 0
-                    continue
-
-                remaining = max(0, int(site_cap) - cum_in)
-                add = min(v, remaining)
-                if add > 0:
-                    U_new[(j_in, t)] = int(U_new[(j_in, t)]) + add
-                    cum_in += add
-
-                # remove from j_out regardless (this is a destroy operator)
-                U_new[(j_out, t)] = 0
-
-            return U_new, before
-
-        # not cumulative: cap per period
-        for t in Ts_sorted:
+        # move schedule period-by-period, enforcing cap if requested
+        for t in Ts:
             v = int(U_new[(j_out, t)])
             if v <= 0:
-                U_new[(j_out, t)] = 0
                 continue
 
-            remaining = max(0, int(site_cap) - int(U_new[(j_in, t)]))
-            add = min(v, remaining)
+            # compute how much we can add to j_in at this period
+            add = v
+            if site_cap is not None:
+                if cumulative_install:
+                    cur = cum_in_site(j_in, t)
+                    remaining = max(0, int(site_cap) - cur)
+                    add = min(add, remaining)
+                else:
+                    remaining = max(0, int(site_cap) - int(U_new[(j_in, t)]))
+                    add = min(add, remaining)
+
             if add > 0:
                 U_new[(j_in, t)] = int(U_new[(j_in, t)]) + add
 
+            # remove from j_out regardless (destroy)
             U_new[(j_out, t)] = 0
 
-        return U_new, before
-
-    # ---------- unit-based destroys ----------
-    if mode in ("k_units", "k"):
-        k_remove = max(1, int(np.ceil(frac_remove * total)))
-    else:
-        # "random_unit" (old weak behavior) or any unknown mode -> fallback
-        k_remove = max(1, int(np.ceil(frac_remove * total)))
-
-    k_remove = min(k_remove, total)
-
-    donors = [k for k, v in U_new.items() if int(v) > 0]
-    if not donors:
+        # site_swap is a move, not a removal
         return U_new, 0
 
-    weights = np.array([max(1e-12, float(U_new[k])) for k in donors], dtype=float)
-    weights /= weights.sum()
+    # ---------------------------------------------------------
+    # 2) LOCAL REMOVE (merged: k_units + site_all + site_future)
+    # ---------------------------------------------------------
+    if mode == "local_remove":
+        totj = tot_by_j()
+        open_sites = [j for j, v in totj.items() if v > 0]
+        if not open_sites:
+            return U_new, 0
 
-    removed = 0
-    for _ in range(k_remove):
-        idx = int(np.random.choice(len(donors), p=weights))
-        key = donors[idx]
-        if U_new[key] > 0:
-            U_new[key] -= 1
-            removed += 1
+        j0 = int(rng.choice(open_sites))
 
-    return U_new, removed
+        # choose which subtype to apply
+        sub = rng.choice(["k_units", "site_all", "site_future"], p=list(local_mix))
+
+        if sub == "site_all":
+            removed = 0
+            for t in Ts:
+                v = int(U_new[(j0, t)])
+                if v > 0:
+                    removed += v
+                    U_new[(j0, t)] = 0
+            return U_new, removed
+
+        if sub == "site_future":
+            t_start = int(rng.choice(Ts))
+            removed = 0
+            for t in Ts:
+                if int(t) >= t_start:
+                    v = int(U_new[(j0, t)])
+                    if v > 0:
+                        removed += v
+                        U_new[(j0, t)] = 0
+            return U_new, removed
+
+        # sub == "k_units"
+        periods_with = [t for t in Ts if int(U_new[(j0, t)]) > 0]
+        if not periods_with:
+            return U_new, 0
+
+        t0 = int(rng.choice(periods_with))
+        v = int(U_new[(j0, t0)])
+        k = max(1, int(round(float(frac_remove) * v)))
+        k = min(k, v)
+
+        U_new[(j0, t0)] = v - k
+        return U_new, k
+
+    # ---------------------------------------------------------
+    # 3) AREA DESTROY (remove installs within radius across all periods)
+    # ---------------------------------------------------------
+    if mode == "area_destroy":
+        coords_J = np.asarray(inst["coords_J"], dtype=float)
+
+        totj = tot_by_j()
+        active = [j for j, v in totj.items() if v > 0]
+        if not active:
+            return U_new, 0
+
+        j_center = int(rng.choice(active))
+        center_xy = coords_J[j_center]
+
+        dists = np.sqrt(np.sum((coords_J - center_xy) ** 2, axis=1))
+
+        # pick radius
+        if area_radius is None:
+            radius = float(np.quantile(dists, float(area_quantile)))
+            if radius <= 1e-12:
+                radius = float(np.max(dists)) * 0.10
+        else:
+            radius = float(area_radius)
+
+        J_neigh = [int(j) for j in range(len(coords_J)) if float(dists[j]) <= radius]
+
+        removed = 0
+        for j in J_neigh:
+            for t in Ts:
+                v = int(U_new[(j, t)])
+                if v > 0:
+                    removed += v
+                    U_new[(j, t)] = 0
+
+        return U_new, removed
+
+    # ---------------------------------------------------------
+    raise ValueError(f"Unknown destroy mode: {mode}")
 
 
 
@@ -882,7 +888,7 @@ def run_DR_multi(
     max_iter: int = 200,
     dr_time_limit: float = 120.0,
     frac_remove: float = 0.20,
-    destroy_mode: str = "random",   # used only if adaptive_destroy=False
+    destroy_mode: str = "local_remove",   # used only if adaptive_destroy=False
     exact_time_limit: float = 120,
     exact_mip_gap: float = 0.10,
     max_chargers_per_site: int | None = None,
@@ -893,13 +899,13 @@ def run_DR_multi(
 
     # --- adaptive destroy knobs ---
     adaptive_destroy: bool = True,
-    destroy_modes: tuple = ("site_all", "site_future", "site_swap", "k_units"),
-    update_every: int = 25,          # update probabilities every N iterations
-    reaction: float = 0.25,          # smoothing for weight update (0.1~0.3 good)
-    score_best_w: float = 6.0,       # reward: makes new global best
-    score_improve_w: float = 2.0,    # reward: improves current
-    score_accept_w: float = 0.5,     # reward: accepted but not improve
-    reconstruct_trials: int = 3,     # how many reconstructions per iteration
+    destroy_modes=("local_remove", "area_destroy", "site_swap"),
+    update_every: int = 25,
+    reaction: float = 0.25,
+    score_best_w: float = 6.0,
+    score_improve_w: float = 2.0,
+    score_accept_w: float = 0.5,
+    reconstruct_trials: int = 3,
 ):
     """
     Multi-period DR:
@@ -912,6 +918,10 @@ def run_DR_multi(
       - adaptive destroy selection (ALNS-style) optional
       - logs per-iteration data into DR_log
       - logs per-batch data into DR_batches (every update_every iters)
+
+    Adds diagnostics:
+      - op_used / op_accepted / op_best counters (total)
+      - DR_batches includes per-mode picked/accepted/acc_rate/best_delta/avg_reward/p_mode
     """
     import time
     import numpy as np
@@ -920,7 +930,7 @@ def run_DR_multi(
     # -------------------------
     # RNG
     # -------------------------
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed if seed is not None else 0)
 
     coords_I, coords_J = inst["coords_I"], inst["coords_J"]
     demand_IT = inst["demand_IT"]
@@ -974,17 +984,28 @@ def run_DR_multi(
     logger = DRLogger()
     dr_trace = []   # per-iteration rich diagnostics
 
-    # per-batch logs
     batch_logs = []
     batch_start_best = float(best_score)
 
-    # uniqueness tracking (optional)
+    # uniqueness tracking
     seen = set()
     def hash_u(Ud):
         return tuple(Ud[k] for k in sorted(Ud.keys()))
     seen.add(hash_u(U_curr))
 
     t_start = time.perf_counter()
+
+    # -------------------------
+    # PROFILING TIMERS
+    # -------------------------
+    t_destroy = 0.0
+    t_reconstruct = 0.0
+    t_eval = 0.0
+    t_log = 0.0
+
+    n_destroy_calls = 0
+    n_reconstruct_calls = 0
+    n_eval_calls = 0
 
     # -------------------------
     # Adaptive destroy init
@@ -1000,10 +1021,10 @@ def run_DR_multi(
         w = np.ones(K_modes, dtype=float)
 
         # window counters (reset every update_every)
-        window_picked    = {m: 0 for m in modes}
-        window_accepted  = {m: 0 for m in modes}
-        window_impr_curr = {m: 0 for m in modes}
-        window_impr_best = {m: 0 for m in modes}
+        window_picked     = {m: 0 for m in modes}
+        window_accepted   = {m: 0 for m in modes}
+        window_impr_curr  = {m: 0 for m in modes}
+        window_impr_best  = {m: 0 for m in modes}
         window_best_delta = {m: 0.0 for m in modes}
         window_reward_sum = {m: 0.0 for m in modes}
 
@@ -1011,6 +1032,18 @@ def run_DR_multi(
         modes = None
         p = None
         w = None
+
+    # -------------------------
+    # TOTAL diagnostics (never reset)
+    # -------------------------
+    if adaptive_destroy:
+        op_used = {m: 0 for m in modes}
+        op_accepted = {m: 0 for m in modes}
+        op_best = {m: 0 for m in modes}
+    else:
+        op_used = {str(destroy_mode): 0}
+        op_accepted = {str(destroy_mode): 0}
+        op_best = {str(destroy_mode): 0}
 
     # -------------------------
     # MAIN LOOP
@@ -1024,18 +1057,27 @@ def run_DR_multi(
         if adaptive_destroy:
             mode = str(rng.choice(modes, p=p))
             window_picked[mode] += 1
+            op_used[mode] += 1
         else:
             mode = str(destroy_mode)
+            op_used[mode] = op_used.get(mode, 0) + 1
 
-        # 2) destroy CURRENT
+        # 2) destroy CURRENT (PROFILED)
+        _t0 = time.perf_counter()
         U_try, k_removed = destroy_multi_u(
-            U_curr, P_T,
+            U_curr,
+            inst=inst,
+            rng=rng,
+            P_T=P_T,
             frac_remove=frac_remove,
             mode=mode,
             seed=seed_iter,
             site_cap=max_chargers_per_site,
             cumulative_install=cumulative_install,
         )
+        t_destroy += (time.perf_counter() - _t0)
+        n_destroy_calls += 1
+
 
         seen.add(hash_u(U_try))
         unique_count = len(seen)
@@ -1071,8 +1113,8 @@ def run_DR_multi(
         # 4) accept/reject
         accepted = (score_try >= score_curr - float(accept_epsilon))
 
-        # rewards computed only if accepted (common ALNS choice)
         reward = 0.0
+        delta_best = 0.0
 
         if accepted:
             score_curr = score_try
@@ -1084,8 +1126,12 @@ def run_DR_multi(
                 best_score = score_try
                 m_best = m_try
                 U_best = dict(U_curr)
-            else:
-                delta_best = 0.0
+
+            # diagnostics
+            op_accepted[mode] = op_accepted.get(mode, 0) + 1
+
+            if improved_best:
+                op_best[mode] = op_best.get(mode, 0) + 1
 
             if adaptive_destroy:
                 window_accepted[mode] += 1
@@ -1106,7 +1152,6 @@ def run_DR_multi(
 
         # 5) update probabilities every update_every
         if adaptive_destroy and (it % int(update_every) == 0):
-            # batch row (so you can print table)
             batch_row = {
                 "iter_from": it - int(update_every) + 1,
                 "iter_to": it,
@@ -1115,8 +1160,6 @@ def run_DR_multi(
                 "batch_best_improvement": float(best_score - batch_start_best),
             }
 
-            # update weights from window performance
-            # score for mode = avg reward per pick (0 if never picked)
             for idx_m, m in enumerate(modes):
                 picked = int(window_picked[m])
                 acc = int(window_accepted[m])
@@ -1134,17 +1177,15 @@ def run_DR_multi(
                 batch_row[f"{m}_reward_sum"] = rs
                 batch_row[f"{m}_avg_reward"] = (rs / picked) if picked > 0 else 0.0
                 batch_row[f"p_{m}"] = float(p[idx_m])
+                batch_row[f"w_{m}"] = float(w[idx_m])
 
+                # weight update
                 score_mode = (rs / picked) if picked > 0 else 0.0
-
-                # ALNS smoothing update
                 w[idx_m] = (1.0 - float(reaction)) * w[idx_m] + float(reaction) * score_mode
                 w[idx_m] = max(w[idx_m], 1e-9)
 
-            # new probabilities from updated weights
             p = w / w.sum()
 
-            # store batch, reset window counters
             batch_logs.append(batch_row)
             batch_start_best = float(best_score)
 
@@ -1156,7 +1197,7 @@ def run_DR_multi(
                 window_best_delta[m] = 0.0
                 window_reward_sum[m] = 0.0
 
-        # 6) core log (DRLogger strict fields only)
+        # 6) core log
         elapsed_now = time.perf_counter() - t_start
         logger.log(
             it=it,
@@ -1169,7 +1210,7 @@ def run_DR_multi(
             unique=unique_count,
         )
 
-        # 7) rich trace (your notebook can plot probability dynamics)
+        # 7) rich trace
         row = {
             "iteration": it,
             "score": score_try,
@@ -1191,10 +1232,13 @@ def run_DR_multi(
         policy=policy,
         score_start=float(score0),
         score_best=float(best_score),
-        DR_log=logger.to_df(),                # clean curve
-        DR_trace=pd.DataFrame(dr_trace),      # per-iteration rich info
-        DR_batches=pd.DataFrame(batch_logs),  # per-window table
+        DR_log=logger.to_df(),
+        DR_trace=pd.DataFrame(dr_trace),
+        DR_batches=pd.DataFrame(batch_logs),
         m_best=m_best,
         distIJ=distIJ,
-        DR_batches=pd.DataFrame(batch_logs),
+        op_used=op_used,
+        op_accepted=op_accepted,
+        op_best=op_best,
+        destroy_modes=list(modes) if adaptive_destroy else [str(destroy_mode)],
     )
