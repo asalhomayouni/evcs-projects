@@ -467,10 +467,12 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
         a = {ii: float(m.a[ii, tt]) for ii in I_list}
 
         # remaining capacity at each site for this period
-        cap_rem = {jj: Q * float(charger_count_t(m, jj, tt)) for jj in J_list}
+        cap_rem = {jj: Q * float(m.x[jj, tt].value or 0.0) for jj in J_list}
+
 
         # open sites this period
-        open_sites = {jj for jj in J_list if open_value_t(m, jj, tt) > 0.5}
+        open_sites = {jj for jj in J_list if (m.x[jj, tt].value or 0.0) >= 1.0 - 1e-9}
+
 
         # STRONG: assign high-demand nodes first
         I_sorted = sorted(I_list, key=lambda ii: a[ii], reverse=True)
@@ -1172,7 +1174,7 @@ def reconstruction_greedy(model, distIJ, demand_I, D, method_name="closest_only"
             return model
 
         weight_mode = "W1" if greedy_mode == "weighted_W1" else "W2"
-        return greedy_add_missing_units_binary(model, distIJ, demand_I, method_name, weight_mode, missing)
+        return greedy_add_missing_units_binary(model, demand_I, weight_mode, missing)
 
     # multi-charger single-period
     cur_total = total_chargers(model)
@@ -1204,7 +1206,19 @@ def reconstruction_greedy(model, distIJ, demand_I, D, method_name="closest_only"
     return model
 
 
-def greedy_add_missing_units_binary(model, distIJ, demand_I, method_name, weight_mode, k_add):
+def greedy_add_missing_units_binary(model, demand_I, weight_mode, k_add, rng=None):
+    """
+    Adds up to k_add new open sites (binary x) using weighted sampling.
+
+    Uses only Arcs and demand_I (NO site-to-site distances).
+    weight_mode:
+      - "W1": total reachable demand from site j
+      - "W2": demand / (1 + #already-open sites that share demand coverage with j)  [overlap-based "near"]
+    """
+    import numpy as np
+    if rng is None:
+        rng = np.random.default_rng(0)
+
     J = list(model.x.keys())
     open_now = set(list_open_sites(model))
     remaining = [j for j in J if j not in open_now]
@@ -1214,25 +1228,39 @@ def greedy_add_missing_units_binary(model, distIJ, demand_I, method_name, weight
     I = range(len(demand_I))
     a = demand_I
 
+    # build Ij sets once for overlap scoring
+    Ij = {j: set() for j in J}
+    for (i, j) in model.Arcs:
+        Ij[int(j)].add(int(i))
+
     def W1(j):
-        total = 0.0
-        for i in I:
-            if (i, j) in model.Arcs:
-                total += a[i]
-        return max(1e-12, total)
+        # total demand reachable by site j
+        return max(1e-12, sum(float(a[i]) for i in Ij[j]))
 
     for _ in range(min(int(k_add), len(remaining))):
         weights = {}
+
         if weight_mode == "W1":
             for j in remaining:
                 weights[j] = W1(j)
         else:
+            # overlap-based penalty with already-open sites (proxy for "near")
             for j in remaining:
-                near = sum(1 for c in open_now if distIJ[j][c] <= D)
-                weights[j] = W1(j) / (1.0 + near)
+                cover_j = Ij[j]
+                overlap_cnt = 0
+                for c in open_now:
+                    if len(cover_j & Ij[c]) > 0:
+                        overlap_cnt += 1
+                weights[j] = W1(j) / (1.0 + overlap_cnt)
 
-        total = sum(weights.values())
-        pick = random.choice(remaining) if total <= 1e-12 else np.random.choice(remaining, p=[weights[j]/total for j in remaining])
+        total = float(sum(weights.values()))
+        if total <= 1e-12:
+            pick = rng.choice(remaining)
+        else:
+            p = np.array([weights[j] / total for j in remaining], dtype=float)
+            p = p / p.sum()
+            pick = rng.choice(remaining, p=p)
+
         model.x[pick].value = 1
         open_now.add(pick)
         remaining.remove(pick)
@@ -1274,3 +1302,4 @@ def compare_solutions(model_A, model_B, demand_I):
         "x_counts_A": A["x_counts"],
         "x_counts_B": B["x_counts"],
     }
+

@@ -39,8 +39,14 @@ def solve_model(
     # Solve model
     res = opt.solve(m)
 
-    term = getattr(res, "termination_condition", "unknown")
-    if verbose:
-        print(f"✅ Solver finished with status: {term}")
+    # Optional: load into model
+    if load_solution:
+        try:
+            if hasattr(res, "solution_loader") and res.solution_loader is not None:
+                res.solution_loader.load_vars()
+        except Exception:
+            pass
 
     return res
+
+
