@@ -19,10 +19,11 @@ from evcs.methods import (
     sync_solution_state,
     greedy_init_simple_variants,
     greedy_schedule_multi_from_variants,
+    evaluate_policy_objective_multi, 
 
 )
 from evcs.solve import solve_model
-
+from pyomo.environ import value
 from scripts.randomInstance import generate_instance, save_instance, load_instance
 
 
@@ -1007,7 +1008,16 @@ def reconstruct_u_dict_fast(
     - Uses capacity-aware uncovered update with charger capacity Q.
     - Returns:
         U_filled : dict mapping (j,t) -> installs
-        proxy_score : float (fast proxy; total "used" demand across all placements)
+        proxy_score : float
+
+    IMPORTANT:
+      This function *does not* know the DR proxy metric (which depends on
+      assignment/order over demand nodes). Therefore, the returned proxy_score
+      is only an internal reconstruction heuristic signal.
+
+      In run_DR_multi() we compute the real proxy with
+      evaluate_u_numpy_greedy_binary() and select the best trial using that
+      consistent proxy.
     """
     import numpy as np
 
@@ -1123,6 +1133,7 @@ def reconstruct_u_dict_fast(
                     uncovered[ii] = False
                     used += di
 
+            # NOTE: this is *not* the DR proxy metric; only a local signal.
             proxy_total += used
 
     return U, float(proxy_total)
@@ -1373,6 +1384,7 @@ def run_DR_multi(
     max_iter: int = 200,
     dr_time_limit: float = 120.0,
     frac_remove: float = 0.20,
+    frac_remove_jump = 0.45,   # strong perturbation level (only used on plateau)
     destroy_mode: str = "local_remove",
     exact_time_limit: float = 120,
     exact_mip_gap: float = 0.10,
@@ -1397,6 +1409,7 @@ def run_DR_multi(
     import time
     import numpy as np
     import pandas as pd
+    from pyomo.environ import value
 
     rng = np.random.default_rng(seed if seed is not None else 0)
 
@@ -1404,9 +1417,9 @@ def run_DR_multi(
     M = len(coords_I)
     N = len(coords_J)
 
-    # ------------------------------
+    # -------------------------------------------------
     # Demand canonicalization ONCE -> demand_TM = (T,M)
-    # ------------------------------
+    # -------------------------------------------------
     demand_raw = inst["demand_IT"]
     demand_arr = np.asarray(demand_raw, dtype=float)
     if demand_arr.ndim != 2:
@@ -1433,14 +1446,11 @@ def run_DR_multi(
     elif len(P_T) < T:
         P_T = P_T + [P_T[-1]] * (T - len(P_T))
 
-    # ------------------------------
-    # Arcs
-    # ------------------------------
+    # -------------------------------------------------
+    # Arcs + adjacency for reconstruction
+    # -------------------------------------------------
     distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D, forbid_self=False)
 
-    # ------------------------------
-    # Adjacency lists
-    # ------------------------------
     Ij_int = {j: [] for j in range(N)}
     Ji_int = {i: [] for i in range(M)}
     for (i, j) in in_range:
@@ -1448,24 +1458,30 @@ def run_DR_multi(
         if 0 <= i < M and 0 <= j < N:
             Ij_int[j].append(i)
             Ji_int[i].append(j)
-    J_i_list = [Ji_int[i] for i in range(M)]
 
+    # -------------------------------------------------
+    # Pre-sort feasible sites for each demand node (closest-first)
+    # -------------------------------------------------
     is_dict = isinstance(distIJ, dict)
-    pre_sorted_J_i = []
+    J_i_list = []
     for i in range(M):
-        js = J_i_list[i]
+        js = Ji_int.get(i, [])
         if not js:
-            pre_sorted_J_i.append([])
+            J_i_list.append([])
         else:
-            pre_sorted_J_i.append(sorted(js, key=lambda j: distIJ[(i, j)] if is_dict else distIJ[i, j]))
+            if is_dict:
+                J_i_list.append(sorted(js, key=lambda j: distIJ[(i, j)]))
+            else:
+                J_i_list.append(sorted(js, key=lambda j: distIJ[i, j]))
+    pre_sorted_J_i = J_i_list
 
-    # ------------------------------
+    # -------------------------------------------------
     # Template model (no solve)
-    # ------------------------------
+    # -------------------------------------------------
     m_template = build_multi_period_model(
         M=M, N=N, T=T,
         in_range=in_range, Ji=Ji, Ij=Ij,
-        demand_IT=demand_TM,
+        demand_IT=demand_TM,                 # IMPORTANT: use (T,M)
         Q=Q, P_T=P_T,
         distIJ=distIJ, method_name=policy,
         max_chargers_per_site=max_chargers_per_site,
@@ -1477,9 +1493,9 @@ def run_DR_multi(
     U_cap = int(m_template.U.value) if hasattr(m_template, "U") else int(max(P_T))
     Q_cap = float(m_template.Q.value)
 
-    # ------------------------------
+    # -------------------------------------------------
     # Initial greedy + exact passthrough
-    # ------------------------------
+    # -------------------------------------------------
     base_out = run_one_policy_multi(
         inst=inst, policy=policy, P_T=P_T, Q=Q, D=D, T=T,
         exact_time_limit=exact_time_limit, exact_mip_gap=exact_mip_gap,
@@ -1488,49 +1504,61 @@ def run_DR_multi(
         seed=seed, verbose=verbose
     )
 
+    # start from greedy solution U
     m0 = base_out["m_best"]
     U_curr = _clone_u_matrix(m0)
-    score0 = evaluate_u_numpy_greedy_binary(
-        U_dict=U_curr,
+
+    # DR proxy state (fast, consistent with capacity/binary assignment)
+    proxy_curr = float(evaluate_u_numpy_greedy_binary(
+        U_curr,
         demand_TM=demand_TM,
         J_i_list=J_i_list,
         distIJ=distIJ,
-        Q_cap=Q_cap,
-        T=T,
-        N=N,
+        Q_cap=float(Q),
+        T=int(T),
+        N=int(N),
         cumulative_install=cumulative_install,
         pre_sorted_J_i=pre_sorted_J_i,
+    ))
+    proxy_best = float(proxy_curr)
+
+    # FULL score (aligned truth metric)
+    ret0 = full_eval_from_U(
+        U_curr, m_template, inst, distIJ, policy,
+        demand_TM=demand_TM,
+        cumulative_install=cumulative_install
     )
+
+    score0 = float(ret0[0])
+    _m0_full = ret0[1]
+    # cov optional
+    _cov0 = ret0[2] if len(ret0) >= 3 else None
+
     score_curr = float(score0)
-    best_score = float(score0)
-    U_best = dict(U_curr)
+    best_full_score = float(score0)
+    U_best_full = dict(U_curr)
+    m_best_full = _m0_full
 
-    # proxy-best (for DR dynamics / plot if you want)
-    best_score = float(score0)          # proxy best (keep your name if you want)
-
-    # full-best (true metric aligned with exact)
-    best_full_score, m_best_full = full_eval_from_U(
-        U_curr, m_template, inst, distIJ, policy, cumulative_install=cumulative_install
-    )
-    U_best_full = dict(U_curr)          # store U for the full-best solution
-
-    # ------------------------------
+    # -------------------------------------------------
     # Logs
-    # ------------------------------
+    # -------------------------------------------------
     logger = DRLogger()
     dr_trace = []
     batch_logs = []
 
-    logger.log(0, float(score_curr), float(best_score), 0.0, 0, "init", 1, 1)
+    logger.log(0, float(proxy_curr), float(best_full_score), 0.0, 0, "init", 1, 1)
     dr_trace.append({
         "iteration": 0,
         "time": 0.0,
         "mode": "init",
         "k_remove": 0,
-        "proxy": np.nan,
-        "score_try": float(score_curr),
-        "score_curr": float(score_curr),
-        "best": float(best_score),
+        "current": float(proxy_curr),
+        "after_destroy": np.nan,
+        "score_try": np.nan,
+        "proxy_try": np.nan,
+        "proxy_curr": float(proxy_curr),
+        "proxy_best": float(proxy_best),
+        "best_full": float(best_full_score),
         "accepted": True,
         "improved_best": True,
         "improved_curr": True,
@@ -1543,6 +1571,7 @@ def run_DR_multi(
 
     t_start = time.perf_counter()
 
+    # Profiling
     t_destroy = t_reconstruct = t_eval = t_log = 0.0
     n_destroy_calls = n_reconstruct_calls = n_eval_calls = 0
 
@@ -1557,7 +1586,7 @@ def run_DR_multi(
         window_accepted = {m: 0 for m in modes}
         window_best_delta = {m: 0.0 for m in modes}
         window_reward_sum = {m: 0.0 for m in modes}
-        batch_start_best = float(best_score)
+        batch_start_best = float(best_full_score)
 
         best_impr_sum = {m: 0.0 for m in modes}
         best_impr_cnt = {m: 0 for m in modes}
@@ -1569,7 +1598,7 @@ def run_DR_multi(
         window_accepted = {modes[0]: 0}
         window_best_delta = {modes[0]: 0.0}
         window_reward_sum = {modes[0]: 0.0}
-        batch_start_best = float(best_score)
+        batch_start_best = float(best_full_score)
         best_impr_sum = {modes[0]: 0.0}
         best_impr_cnt = {modes[0]: 0}
 
@@ -1577,16 +1606,15 @@ def run_DR_multi(
     op_accepted = {m: 0 for m in modes}
     op_best = {m: 0 for m in modes}
 
-    
-
     # ------------------------------
     # MAIN LOOP + stagnation kick
     # ------------------------------
     no_improve_batches = 0
     force_iters_left = 0
     forced_mode = None
+    no_full_improve_iters = 0
 
-    frac_remove_base = float(frac_remove)
+    frac_remove = float(frac_remove)
     accept_epsilon_base = float(accept_epsilon)
 
     it = 0
@@ -1620,25 +1648,51 @@ def run_DR_multi(
         t_destroy += (time.perf_counter() - _t0)
         n_destroy_calls += 1
 
-        # reconstruct (trials)
+        # proxy right after destroy (gives the "dip" in the old plot)
+        proxy_after_destroy = float(evaluate_u_numpy_greedy_binary(
+            U_try,
+            demand_TM=demand_TM,
+            J_i_list=J_i_list,
+            distIJ=distIJ,
+            Q_cap=float(Q),
+            T=int(T),
+            N=int(N),
+            cumulative_install=cumulative_install,
+            pre_sorted_J_i=pre_sorted_J_i,
+        ))
+
+        # reconstruct (trials) -> pick best CONSISTENT proxy
         _t0 = time.perf_counter()
         best_proxy = -1e18
         best_U_candidate = None
 
         for _ in range(int(reconstruct_trials)):
-            U_fill, proxy = reconstruct_u_dict_fast(
+            U_fill, _sig = reconstruct_u_dict_fast(
                 U_partial=dict(U_try),
-                demand_IT=demand_TM,
+                demand_IT=demand_TM,           # IMPORTANT: (T,M)
                 P_T=P_T,
                 Ij_int=Ij_int,
                 U_cap=U_cap,
-                Q=Q_cap,
+                Q=float(Q),
                 rng=rng,
                 cumulative_install=cumulative_install,
                 top_k_choice=int(top_k_choice),
             )
+
+            proxy = float(evaluate_u_numpy_greedy_binary(
+                U_fill,
+                demand_TM=demand_TM,
+                J_i_list=J_i_list,
+                distIJ=distIJ,
+                Q_cap=float(Q),
+                T=int(T),
+                N=int(N),
+                cumulative_install=cumulative_install,
+                pre_sorted_J_i=pre_sorted_J_i,
+            ))
+
             if proxy > best_proxy:
-                best_proxy = proxy
+                best_proxy = float(proxy)
                 best_U_candidate = U_fill
 
         t_reconstruct += (time.perf_counter() - _t0)
@@ -1647,74 +1701,143 @@ def run_DR_multi(
         if best_U_candidate is None:
             best_U_candidate = dict(U_try)
 
-        # evaluate candidate (this is your "true" score used everywhere)
-        _t1 = time.perf_counter()
-        score_try = evaluate_u_numpy_greedy_binary(
-            U_dict=best_U_candidate,
-            demand_TM=demand_TM,
-            J_i_list=J_i_list,
-            distIJ=distIJ,
-            Q_cap=Q_cap,
-            T=T,
-            N=N,
-            cumulative_install=cumulative_install,
-            pre_sorted_J_i=pre_sorted_J_i,
-        )
-        t_eval += (time.perf_counter() - _t1)
-        n_eval_calls += 1
+        proxy_try = float(best_proxy)
 
-        # acceptance (proxy)
-        accepted = (score_try >= score_curr - float(accept_epsilon))
-        improved_curr = (score_try > score_curr + 1e-9)
-
-        # proxy-improved-best (used only to decide when to call full eval)
-        proxy_improved_best = (score_try > best_score + 1e-9)
+        # acceptance on PROXY (fast)
+        accepted = (proxy_try >= proxy_curr - float(accept_epsilon))
+        improved_curr = (proxy_try > proxy_curr + 1e-9)
+        proxy_improved_best = (proxy_try > proxy_best + 1e-9)
 
         reward = 0.0
-        delta_best = 0.0
+        did_full_eval = False
+        full_score_try = np.nan
+        improved_best_full = False
+        delta_best_full = 0.0
 
         if accepted:
-            score_curr = float(score_try)
+            proxy_curr = float(proxy_try)
             U_curr = dict(best_U_candidate)
             op_accepted[mode] += 1
             window_accepted[mode] += 1
 
-            # Only when proxy says "this could be a new best" -> do expensive full eval
-            improved_best = False
-            if proxy_improved_best:
-                cand_full_score, cand_full_model = full_eval_from_U(
-                    U_curr, m_template, inst, distIJ, policy,
+            # confirm proxy-best with FULL evaluation
+            do_full = proxy_improved_best or (it % 8 == 0)
+
+            if do_full:
+                # only update proxy_best when it truly improves
+                if proxy_improved_best:
+                    proxy_best = float(proxy_try)
+
+                _t1 = time.perf_counter()
+                ret_full = full_eval_from_U(
+                    best_U_candidate, m_template, inst, distIJ, policy,
+                    demand_TM=demand_TM,
                     cumulative_install=cumulative_install
                 )
 
-                if cand_full_score > best_full_score + 1e-9:
-                    improved_best = True
-                    delta_best = float(cand_full_score - best_full_score)
+                # supports (score, model) OR (score, model, cov)
+                full_score_try = float(ret_full[0])
+                _m_tmp = ret_full[1]
+                _cov = ret_full[2] if len(ret_full) >= 3 else None
 
-                    # update TRUE best (full metric)
-                    best_full_score = float(cand_full_score)
-                    U_best_full = dict(U_curr)
-                    m_best_full = cand_full_model
+                t_eval += (time.perf_counter() - _t1)
+                n_eval_calls += 1
+                did_full_eval = True
 
-                    # (optional) also track proxy best for plotting
-                    best_score = float(score_try)
+                if full_score_try > best_full_score + 1e-9:
+                    improved_best_full = True
+                    delta_best_full = float(full_score_try - best_full_score)
+                    best_full_score = float(full_score_try)
+                    U_best_full = dict(best_U_candidate)
+                    m_best_full = _m_tmp
 
                     op_best[mode] += 1
-                    best_impr_sum[mode] += delta_best
+                    best_impr_sum[mode] += delta_best_full
                     best_impr_cnt[mode] += 1
-                    window_best_delta[mode] += delta_best
+                    window_best_delta[mode] += delta_best_full
 
-            # rewards (same structure)
-            if improved_best:
+            # reward (stays the same)
+            if improved_best_full:
                 reward = float(score_best_w)
             elif improved_curr:
                 reward = float(score_improve_w)
             else:
                 reward = float(score_accept_w)
 
-        window_reward_sum[mode] += float(reward)
+            window_reward_sum[mode] += float(reward)
+        
+        
+        # ==========================
+        # Track full stagnation
+        # ==========================
+        if improved_best_full:
+            no_full_improve_iters = 0
+        else:
+            no_full_improve_iters += 1
+        # ==========================================
+        # ILS STRONG PERTURBATION
+        # ==========================================
+        if no_full_improve_iters >= 40:
 
+            # Large destruction
+            mode_jump = rng.choice(
+                ["area_destroy", "local_remove", "site_swap"],
+                p=[0.3, 0.2, 0.5]
+            )
 
+            U_jump, _ = destroy_multi_u(
+                U_curr,
+                inst=inst,
+                rng=rng,
+                P_T=P_T,
+                frac_remove=frac_remove_jump,
+                mode=mode_jump,              # ✅ correct keyword
+                seed=None,
+                site_cap=max_chargers_per_site,
+                cumulative_install=cumulative_install,
+            )
+
+            # Reconstruct once
+            # ---------------------------------
+            top_k_choice_jump = 20
+            reconstruct_trials_jump = 15
+
+            best_local_fast = -1e30
+            U_candidate_jump = None
+            for _ in range(reconstruct_trials_jump):
+                U_fill, fast_proxy = reconstruct_u_dict_fast(
+                    U_partial=dict(U_jump),
+                    demand_IT=demand_TM,
+                    P_T=P_T,
+                    Ij_int=Ij_int,
+                    U_cap=U_cap,
+                    Q=Q_cap,
+                    rng=rng,
+                    cumulative_install=cumulative_install,
+                    top_k_choice=top_k_choice_jump,
+                )
+
+                if fast_proxy > best_local_fast:
+                    best_local_fast = fast_proxy
+                    U_candidate_jump = U_fill
+
+            if U_candidate_jump is not None:
+                U_curr = dict(U_candidate_jump)
+
+                proxy_curr = evaluate_u_numpy_greedy_binary(
+                    U_curr,
+                    demand_TM=demand_TM,
+                    J_i_list=J_i_list,
+                    distIJ=distIJ,
+                    Q_cap=Q_cap,
+                    T=T,
+                    N=N,
+                    cumulative_install=cumulative_install,
+                )
+
+            no_full_improve_iters = 0
+
+        
         # trace
         elapsed = float(time.perf_counter() - t_start)
         dr_trace.append({
@@ -1722,15 +1845,24 @@ def run_DR_multi(
             "time": float(elapsed),
             "mode": str(mode),
             "k_remove": float(k_removed) if k_removed is not None else np.nan,
-            "proxy": float(best_proxy),
-            "score_try": float(score_try),
-            "score_curr": float(score_curr),
-            "best": float(best_score),
-            "accepted": bool(accepted),
-            "improved_best": bool(improved_best),
-            "improved_curr": bool(improved_curr),
-            "best_proxy": float(best_score),
+
+            # plot layers (proxy)
+            "current": float(proxy_curr),
+            "after_destroy": float(proxy_after_destroy),
+            "score_try": float(proxy_try),
+
+            "proxy_try": float(proxy_try),
+            "proxy_curr": float(proxy_curr),
+            "proxy_best": float(proxy_best),
+
+            "did_full_eval": bool(did_full_eval),
+            "score_try_full": float(full_score_try) if did_full_eval else np.nan,
             "best_full": float(best_full_score),
+
+            "accepted": bool(accepted),
+            "improved_curr": bool(improved_curr),
+            "proxy_improved_best": bool(proxy_improved_best),
+            "improved_best_full": bool(improved_best_full),
         })
 
         # logger
@@ -1738,8 +1870,8 @@ def run_DR_multi(
         seen.add(hash_u(U_curr))
         logger.log(
             int(it),
-            float(score_curr),
-            float(best_score),
+            float(proxy_curr),
+            float(best_full_score),
             float(elapsed),
             int(k_removed) if k_removed is not None else 0,
             str(mode),
@@ -1748,15 +1880,12 @@ def run_DR_multi(
         )
         t_log += (time.perf_counter() - _tlog0)
 
-        # batch update + kick
+        # batch update + kick (use FULL best)
         if adaptive_destroy and (it % int(update_every) == 0):
-            batch_end_best = float(best_score)
+            batch_end_best = float(best_full_score)
             batch_impr = batch_end_best - float(batch_start_best)
 
-            if batch_impr <= 1e-12:
-                no_improve_batches += 1
-            else:
-                no_improve_batches = 0
+            no_improve_batches = (no_improve_batches + 1) if (batch_impr <= 1e-12) else 0
 
             if no_improve_batches >= 2:
                 frac_remove = min(0.80, float(frac_remove) + 0.15)
@@ -1767,7 +1896,7 @@ def run_DR_multi(
                 forced_mode = "area_destroy"
                 force_iters_left = 15
             else:
-                frac_remove = max(frac_remove_base, float(frac_remove) - 0.05)
+                frac_remove= max(frac_remove, float(frac_remove) - 0.05)
                 accept_epsilon = max(accept_epsilon_base, float(accept_epsilon) - 0.03)
                 if force_iters_left <= 0:
                     forced_mode = None
@@ -1798,7 +1927,7 @@ def run_DR_multi(
             w = np.maximum(w, 1e-9)
             p = w / w.sum()
 
-            batch_start_best = float(best_score)
+            batch_start_best = float(best_full_score)
             for m in modes:
                 window_picked[m] = 0
                 window_accepted[m] = 0
@@ -1806,36 +1935,10 @@ def run_DR_multi(
                 window_reward_sum[m] = 0.0
 
     # ------------------------------
-    # End loop: build final model
+    # End loop: profiling
     # ------------------------------
     total_elapsed = float(time.perf_counter() - t_start)
     t_other = max(0.0, total_elapsed - (t_destroy + t_reconstruct + t_eval + t_log))
-
-    m_best = m_template.clone()
-    _apply_u_matrix(m_best, U_best)
-    sync_solution_state(m_best, cumulative_install=cumulative_install)
-    m_best = reassign_y_greedy_multi(
-        m_best, distIJ, Ji=None, method_name=policy, cumulative_install=cumulative_install
-    )
-    # ---- FINAL TRUE DR SCORE (aligned with exact/table) ----
-    cov_d = covered_by_period(m_best, inst)          # per-period covered demand
-    score_dr_best = float(np.sum(cov_d))             # total covered demand
-
-    # store for table/plot consistency
-    # (NOTE: out_dr doesn't exist yet; you return a dict below)
-
-    # ✅ compute DR best score consistently (same evaluator used during search)
-    score_dr_best = evaluate_u_numpy_greedy_binary(
-        U_dict=U_best,
-        demand_TM=demand_TM,
-        J_i_list=J_i_list,
-        distIJ=distIJ,
-        Q_cap=Q_cap,
-        T=T,
-        N=N,
-        cumulative_install=cumulative_install,
-        pre_sorted_J_i=pre_sorted_J_i,
-    )
 
     profiling = dict(
         total_elapsed=float(total_elapsed),
@@ -1860,76 +1963,59 @@ def run_DR_multi(
             "used": int(op_used.get(m, 0)),
             "accepted": int(op_accepted.get(m, 0)),
             "best_hits": int(op_best.get(m, 0)),
+            
         })
     df_contrib = pd.DataFrame(contrib_rows).sort_values("best_impr_sum", ascending=False)
-
-    inst_tag = str(inst.get("meta", {}).get("tag", ""))  # optional
-    m_exact = base_out.get("m_exact", None)
-
-    if m_exact is not None and base_out.get("exact_has_feasible", False):
-        cov_e = covered_by_period(m_exact, inst)
-        exact_score = float(np.sum(cov_e))
-    else:
-        exact_score = None
-
-    score_dr_best = float(best_full_score)  # full metric best
-
-    # ---- FULL eval helper (must match DR metric) ----
-    def full_eval_from_U(U_dict):
-        m = m_template.clone()
-        _apply_u_matrix(m, U_dict)
+    def full_eval_model(m_in):
+        m = m_in.clone()
         sync_solution_state(m, cumulative_install=cumulative_install)
         m = reassign_y_greedy_multi(m, distIJ, Ji=None, method_name=policy,
-                                cumulative_install=cumulative_install)
+                                    cumulative_install=cumulative_install)
         cov = covered_by_period(m, inst)
-        return float(np.sum(cov)), cov
+        return float(np.sum(cov))
+    # ------------------------------
+    # Exact (aligned metric: same as DR)
 
-    # DR FULL
-    dr_full_score, dr_cov = full_eval_from_U(U_best)
-
-    # Exact FULL (ONLY if available)
+    inst_tag = str(inst.get("meta", {}).get("tag", ""))
     m_exact = base_out.get("m_exact", None)
+
+    exact_score = None
+    exact_raw_obj = None
+
     if m_exact is not None and base_out.get("exact_has_feasible", False):
-        U_exact = _clone_u_matrix(m_exact)   # or build U_dict from m_exact.u
-        ex_full_score, ex_cov = full_eval_from_U(U_exact)
-    else:
-        ex_full_score, ex_cov = None, None
+        exact_score = float(full_eval_model(m_exact))          # aligned metric
+        exact_raw_obj = float(value(m_exact.obj))              # debug only
 
     return dict(
         inst_tag=inst_tag,
         policy=policy,
-        score_start=float(score0),
-        score_best=float(best_score),  # this is your PROXY best (keep if you want)
 
-        DR_log=logger.to_df(),
-        DR_trace=pd.DataFrame(dr_trace),
-        DR_batches=pd.DataFrame(batch_logs),
-        DR_contrib=df_contrib,
+        # DR best (aligned)
+        m_best=m_best_full,
+        U_best=dict(U_best_full),
+        DR_best_total_eval=float(best_full_score),
 
-        # ---- EXACT (aligned metric) ----
+        # exact (aligned)
         m_exact=m_exact,
-        exact_score=exact_score,
-        score_exact=exact_score,  # alias for older code
-        exact_has_feasible=base_out.get("exact_has_feasible", False),
+        exact_score=float(exact_score) if exact_score is not None else None,
+        exact_raw_obj=float(exact_raw_obj) if exact_raw_obj is not None else None,
+        exact_has_feasible=bool(base_out.get("exact_has_feasible", False)),
         time_exact=base_out.get("time_exact", None),
         exact_termination=base_out.get("exact_termination", None),
         exact_gap=base_out.get("exact_gap", None),
         proven_optimal=base_out.get("proven_optimal_exact", False),
 
-        # ---- DR best (aligned metric) ----
-        m_best=m_best_full,
-        DR_best_total_eval=score_dr_best,
-        U_best=dict(U_best_full),  # IMPORTANT: use FULL-best U, not proxy-best U
+        # logs
+        DR_log=logger.to_df(),
+        DR_trace=pd.DataFrame(dr_trace),
+        DR_batches=pd.DataFrame(batch_logs),
+        DR_contrib=df_contrib,
 
         # misc
         distIJ=distIJ,
         destroy_modes=list(modes),
         profiling=profiling,
-        DR_best_total_eval=float(dr_full_score),
-        exact_score=(float(ex_full_score) if ex_full_score is not None else None),
-        m_exact=m_exact,
     )
-
 
 def covered_by_period(m, inst, y_thr=0.5):
     """
@@ -1992,10 +2078,18 @@ def covered_by_period(m, inst, y_thr=0.5):
     return cov
 
 
-def full_eval_from_U(U_dict, m_template, inst, distIJ, policy, cumulative_install=True):
+def full_eval_from_U(U_dict, m_template, inst, distIJ, policy, demand_TM, cumulative_install=True):
+    import numpy as np
+
     m = m_template.clone()
     _apply_u_matrix(m, U_dict)
     sync_solution_state(m, cumulative_install=cumulative_install)
-    m = reassign_y_greedy_multi(m, distIJ, Ji=None, method_name=policy, cumulative_install=cumulative_install)
-    cov = covered_by_period(m, inst)
-    return float(np.sum(cov)), m
+
+    # IMPORTANT: this must be the FIXED version (correct indentation, correct policy behavior)
+    m = reassign_y_greedy_multi(
+        m, distIJ, Ji=None, method_name=policy, cumulative_install=cumulative_install
+    )
+
+    cov = covered_by_period(m, inst)      # uses inst["demand_IT"], safe orientation inside
+    score = float(np.sum(cov))
+    return float(score), m, cov

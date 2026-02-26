@@ -171,6 +171,44 @@ def evaluate_solution(m, distIJ, demand_I, method_name="closest_only"):
     cov_pct = 100.0 * covered / total_demand if total_demand > 0 else 0.0
     return {"covered_demand": covered, "covered_pct": cov_pct}
 
+from pyomo.environ import value
+
+def evaluate_policy_objective_multi(m, demand_IT, distIJ=None, method_name="closest_only"):
+    """
+    Returns the SAME objective value as apply_method_multi() defines for each policy.
+    """
+    name = str(method_name).lower()
+
+    # coverage part
+    cov = 0.0
+    for (i, j) in m.Arcs:
+        ii, jj = int(i), int(j)
+        for t in m.T:
+            tt = int(t)
+            d = float(demand_IT[tt][ii])
+            cov += d * float(m.y[i, j, t].value or 0.0)
+
+    if name == "closest_priority":
+        # same as apply_method_multi: + 1e-3 * sum((1-dist)*y)
+        tie = 0.0
+        for (i, j) in m.Arcs:
+            ii, jj = int(i), int(j)
+            for t in m.T:
+                tie += (1.0 - float(distIJ[ii][jj])) * float(m.y[i, j, t].value or 0.0)
+        return cov + 1e-3 * tie
+
+    if name == "system_optimum":
+        # same as apply_method_multi: - 0.1 * sum(dist*y)
+        lam = 0.1
+        dist_term = 0.0
+        for (i, j) in m.Arcs:
+            ii, jj = int(i), int(j)
+            for t in m.T:
+                dist_term += float(distIJ[ii][jj]) * float(m.y[i, j, t].value or 0.0)
+        return cov - lam * dist_term
+
+    # closest_only / default / uniform => coverage objective in your code
+    return cov
 
 def evaluate_solution_multi(m, demand_IT):
     """
@@ -432,83 +470,111 @@ import random
 def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install: bool = True):
     """
     Multi-period greedy assignment (BINARY y).
-    - y[i,j,t] is set to 0/1 only
-    - each demand i at time t assigned to at most one open site
-    - capacity: sum_i a[i,t] * y[i,j,t] <= Q * x[j,t]
-    
-    Strong greedy:
-      - assigns i in descending demand order (per period)
-      - uses Best-Fit among feasible open sites (fills capacity tightly)
-      - uniform remains random among FEASIBLE open sites
+    - y[i,j,t] in {0,1}
+    - each i at time t assigned to at most one open site
+    - capacity uses YOUR model notion: Q * charger_count_t(m,j,t)
+    - open uses YOUR model notion: open_value_t(m,j,t)
+
+    Policies supported (case-insensitive):
+      - closest_only
+      - closest_priority
+      - system_optimum
+      - uniform
+      - default: best-fit (tight fill)
     """
     import random
+
+    # make sure x/z etc are consistent with u (and cumulative_install)
     sync_solution_state(m, cumulative_install=cumulative_install)
 
     I_list = [int(i) for i in m.I]
     J_list = [int(j) for j in m.J]
     T_list = [int(t) for t in m.T]
-    Q = float(m.Q.value)
+    Q = float(value(m.Q))
 
-    # --- Rebuild adjacency from Arcs (int keys) ---
+    # --- adjacency: reachable sites per i from Arcs ---
     Ji_int = {}
     for (i, j) in m.Arcs:
         ii, jj = int(i), int(j)
         Ji_int.setdefault(ii, []).append(jj)
 
-    # --- Clear y (binary) ---
+    # --- clear y ---
     for (i, j) in m.Arcs:
         ii, jj = int(i), int(j)
         for tt in T_list:
             m.y[ii, jj, tt].value = 0
 
-    # --- Assign per period ---
+    # robust distance getter (works for dict, ndarray, nested list)
+    def dij(ii_, jj_):
+        try:
+            return float(distIJ[(ii_, jj_)])
+        except Exception:
+            try:
+                return float(distIJ[ii_, jj_])
+            except Exception:
+                return float(distIJ[ii_][jj_])
+
+    name = str(method_name).lower().strip()
+
+    # --- assign per period ---
     for tt in T_list:
-        # period demand
-        a = {ii: float(m.a[ii, tt]) for ii in I_list}
+        # demand in this period (Pyomo-safe)
+        a = {ii: float(value(m.a[ii, tt])) for ii in I_list}
 
-        # remaining capacity at each site for this period
-        cap_rem = {jj: Q * float(m.x[jj, tt].value or 0.0) for jj in J_list}
+        # remaining capacity per site this period = Q * (#chargers available)
+        cap_rem = {
+            jj: Q * float(charger_count_t(m, jj, tt))
+            for jj in J_list
+        }
 
+        # open sites this period (must be consistent with model)
+        open_sites = {jj for jj in J_list if open_value_t(m, jj, tt) > 0.5}
 
-        # open sites this period
-        open_sites = {jj for jj in J_list if (m.x[jj, tt].value or 0.0) >= 1.0 - 1e-9}
-
-
-        # STRONG: assign high-demand nodes first
+        # assign highest demand first
         I_sorted = sorted(I_list, key=lambda ii: a[ii], reverse=True)
 
         for ii in I_sorted:
+            if a[ii] <= 1e-12:
+                continue
+
             reachable = Ji_int.get(ii, [])
             if not reachable:
                 continue
 
+            # open among reachable
             open_reach = [jj for jj in reachable if jj in open_sites]
             if not open_reach:
                 continue
 
-            # only keep feasible by remaining capacity
+            # capacity-feasible among open
             feasible = [jj for jj in open_reach if cap_rem[jj] >= a[ii] - 1e-9]
             if not feasible:
                 continue
 
-            if method_name == "uniform":
-                # random among feasible (still binary)
+            # choose according to policy
+            if name == "closest_only":
+                chosen = min(feasible, key=lambda jj: dij(ii, jj))
+
+            elif name == "closest_priority":
+                # distance first, then tighter fill
+                chosen = min(feasible, key=lambda jj: (dij(ii, jj), cap_rem[jj] - a[ii]))
+
+            elif name == "system_optimum":
+                # cost proxy: demand * distance, then tighter fill
+                chosen = min(feasible, key=lambda jj: (a[ii] * dij(ii, jj), cap_rem[jj] - a[ii]))
+
+            elif name == "uniform":
                 chosen = random.choice(feasible)
 
             else:
-                # STRONG: Best-Fit (min remaining capacity after placing ii)
-                # tie-break by distance
-                chosen = min(
-                    feasible,
-                    key=lambda jj: (cap_rem[jj] - a[ii], distIJ[ii][jj])
-                )
+                # default: Best-Fit (min remaining capacity after placing ii), tie-break by distance
+                chosen = min(feasible, key=lambda jj: (cap_rem[jj] - a[ii], dij(ii, jj)))
 
+            # commit assignment
             m.y[ii, chosen, tt].value = 1
             cap_rem[chosen] -= a[ii]
 
     return m
-
-
 # =========================================================
 # Simplified Greedy Initializers (FAST variants A–E)
 # =========================================================
@@ -1302,4 +1368,3 @@ def compare_solutions(model_A, model_B, demand_I):
         "x_counts_A": A["x_counts"],
         "x_counts_B": B["x_counts"],
     }
-
