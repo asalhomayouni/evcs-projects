@@ -24,8 +24,7 @@ from evcs.methods import (
 )
 from evcs.solve import solve_model
 from pyomo.environ import value
-from scripts.randomInstance import generate_instance, save_instance, load_instance
-
+from Instance import generate_instance, save_instance_npz as save_instance, load_instance_npz as load_instance
 
 
 class DRLogger:
@@ -144,7 +143,7 @@ def run_one_policy(
         res = solve_model(
             m_exact, verbose=False,
             time_limit=exact_time_limit,
-            mip_gap=(exact_time_limit and exact_mip_gap)
+            mip_gap=exact_mip_gap
         )
         time_exact = time.perf_counter() - t0
         score_exact = evaluate_solution(m_exact, distIJ, demand_I, method_name=policy)["covered_demand"]
@@ -467,21 +466,55 @@ def run_one_policy_multi(
 
         farther_of = compute_farther(distIJ, in_range, Ji)
         m_exact = apply_method_multi(m_exact, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
-
+        
+        import time
         t0 = time.perf_counter()
-
+        
         # ✅ Let solve_model load the incumbent if it can.
         # Your solve.py supports load_solution, so use it.
-        res = solve_model(
+        sol = solve_model(
             m_exact,
             verbose=verbose,
             time_limit=exact_time_limit,
             mip_gap=exact_mip_gap,
-            load_solution=True,
+            load_solution=False,   # recommended for time-limited MIP
         )
 
-        time_exact = time.perf_counter() - t0
+        res = sol["res"]
+        import numpy as np
 
+        best_feas  = getattr(res, "best_feasible_objective", None)
+        best_bound = getattr(res, "best_objective_bound", None)
+
+        def _num(x):
+            try:
+                return float(x)
+            except Exception:
+                return np.nan
+
+        best_feas_f  = _num(best_feas)
+        best_bound_f = _num(best_bound)
+
+        exact_has_feasible = np.isfinite(best_feas_f)
+
+        # relative gap (if both exist)
+        exact_gap = np.nan
+        if exact_has_feasible and np.isfinite(best_bound_f):
+            denom = max(1e-9, abs(best_feas_f))
+            exact_gap = (best_bound_f - best_feas_f) / denom  # (for maximize, bound >= feas)
+
+        # termination
+        exact_term = getattr(res, "termination_condition", None)
+        best_feas = sol.get("best_feasible_objective", None)
+        best_bound = sol.get("best_objective_bound", None)
+
+        exact_gap = None
+        if best_feas is not None and best_bound is not None:
+            denom = max(1e-9, abs(best_feas))
+            exact_gap = (best_bound - best_feas) / denom   # maximize => bound >= feas
+
+        time_exact = time.perf_counter() - t0
+        
         # termination
         try:
             tc = res.solver.termination_condition
@@ -601,17 +634,19 @@ def run_one_policy_multi(
         score_greedy=score_greedy,
         m_exact=m_exact,
         score_exact=score_exact,
-        exact_has_feasible=bool(exact_has_feasible),
-        exact_termination=exact_termination,
         proven_optimal_exact=bool(proven_optimal_exact),
-        exact_gap=exact_gap,
-        exact_bound=exact_bound,
-        exact_incumbent_obj=exact_incumbent_obj,
         time_exact=time_exact,
         distIJ=distIJ,
         in_range=in_range,
         Ji=Ji,
         Ij=Ij,
+        exact_has_feasible=bool(exact_has_feasible),
+        exact_incumbent_obj=best_feas_f if exact_has_feasible else None,
+        exact_bound=best_bound_f if np.isfinite(best_bound_f) else None,
+        exact_gap=exact_gap if np.isfinite(exact_gap) else None,
+        exact_termination=exact_term,
+
+
     )
 
 # =========================================================
@@ -656,24 +691,7 @@ def destroy_multi_u(
     area_quantile: float = 0.25,
     local_mix=(0.50, 0.25, 0.25),  # k_units, site_all, site_future
 ):
-    """
-    Destroy operator for multi-period installs Udict[(j,t)].
-
-    Inputs:
-      - Udict: dict {(j,t): int installs} for all j in J, t in T
-      - inst: must contain "coords_J"
-      - rng: np.random.Generator (preferred); if seed given, we create a local rng
-      - P_T: list length T (not directly used here, but kept for interface consistency)
-      - mode: "site_swap" | "local_remove" | "area_destroy"
-      - site_cap: max chargers at a site (cap)
-      - cumulative_install:
-          True  => cap applies to cumulative sum across all periods at that site
-          False => cap applies to per-period installs
-
-    Returns:
-      - U_new: new dict (copy) after destruction
-      - k_removed: int number of installs removed (site_swap moves, so k_removed=0)
-    """
+   
     # Local RNG if seed provided (do NOT touch global np.random)
     if seed is not None:
         rng = np.random.default_rng(int(seed))
@@ -707,7 +725,7 @@ def destroy_multi_u(
     # ---------------------------------------------------------
     # 1) SITE SWAP  (move schedule from one open site to another)
     # ---------------------------------------------------------
-    if mode in ("site_swap", "swap"):
+    if mode in ("site_swap"):
         totj = tot_by_j()
         open_sites = [j for j, v in totj.items() if v > 0]
         if not open_sites:
@@ -1395,7 +1413,7 @@ def run_DR_multi(
     accept_epsilon: float = 0.02,
 
     adaptive_destroy: bool = True,
-    destroy_modes=("local_remove", "area_destroy", "site_swap"),
+    destroy_modes = ["site_swap", "local_remove", "area_destroy"],
     update_every: int = 25,
     reaction: float = 0.25,
     score_best_w: float = 6.0,
@@ -1721,7 +1739,8 @@ def run_DR_multi(
             window_accepted[mode] += 1
 
             # confirm proxy-best with FULL evaluation
-            do_full = proxy_improved_best or (it % 8 == 0)
+            FULL_EVAL_EVERY = 50        # <-- benchmarking default (try 50 or 100)
+            do_full = proxy_improved_best or (it % FULL_EVAL_EVERY == 0)
 
             if do_full:
                 # only update proxy_best when it truly improves
@@ -1777,7 +1796,7 @@ def run_DR_multi(
         # ==========================================
         # ILS STRONG PERTURBATION
         # ==========================================
-        if no_full_improve_iters >= 40:
+        if no_full_improve_iters >= 100:
 
             # Large destruction
             mode_jump = rng.choice(
@@ -2015,6 +2034,9 @@ def run_DR_multi(
         distIJ=distIJ,
         destroy_modes=list(modes),
         profiling=profiling,
+        DR_total_full_evals=int(n_eval_calls),
+        DR_best_proxy=float(proxy_best),
+        DR_time=float(total_elapsed),
     )
 
 def covered_by_period(m, inst, y_thr=0.5):

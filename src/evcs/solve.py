@@ -39,6 +39,10 @@ def solve_model(
     # Solve model
     res = opt.solve(m)
 
+    # DEBUG: inspect what res contains
+    print("RES TYPE:", type(res))
+    print("RES DIR sample:", [x for x in dir(res) if "gap" in x.lower() or "bound" in x.lower() or "obj" in x.lower()][:50])
+    
     # Optional: load into model
     if load_solution:
         try:
@@ -47,6 +51,23 @@ def solve_model(
         except Exception:
             pass
 
-    return res
+        # Extract incumbent + bound when available (HiGHS MIP)
+    best_feas = None
+    best_bound = None
+    try:
+        best_feas = float(res.best_feasible_objective)
+    except Exception:
+        pass
+    try:
+        best_bound = float(res.best_objective_bound)
+    except Exception:
+        pass
+
+    return {
+        "res": res,
+        "termination": getattr(res, "termination_condition", None),
+        "best_feasible_objective": best_feas,
+        "best_objective_bound": best_bound,
+    }
 
 

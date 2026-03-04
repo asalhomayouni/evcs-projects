@@ -26,7 +26,7 @@ from evcs.solve import solve_model
 # Instance generator (absolute imports)
 # =========================================================
 
-from scripts.randomInstance import (
+from scripts.Instance import (
     generate_instance,
     save_instance,
     load_instance,

@@ -168,7 +168,7 @@ def build_multi_period_model(
         m.z = Var(m.J, m.T, within=Binary)                               # open indicator
         m.y = Var(m.Arcs, m.T, within=Binary)
 
-
+        m.open_charger_link = Constraint(m.J, m.T, rule=lambda m, j, t: m.x[j, t] >= m.z[j, t])
     # --- Objective: maximize total covered demand (sum over time) ---
     def obj_rule(m):
         return sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)

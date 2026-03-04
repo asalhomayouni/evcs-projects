@@ -290,6 +290,9 @@ def add_uniform_allocation_constraints(m):
     expr_cov = sum(m.a[i] * m.y[i, j] for (i, j) in m.Arcs)
     m.obj = Objective(expr=expr_cov, sense=maximize)
 
+    # prevent Pyomo "Implicitly replacing Component" warning
+    if hasattr(m, "uniform_alloc"):
+        m.del_component(m.uniform_alloc)
     m.uniform_alloc = ConstraintList()
     for i in m.I:
         reach = [j for j in m.J if (i, j) in m.Arcs]
@@ -347,48 +350,49 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
         expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
         m.obj = Objective(expr=expr_cov, sense=maximize)
 
+    # -------------------------
+    # UNIFORM
+    # -------------------------
     if name == "uniform":
-        _reset_obj_multi(m)
-        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
-        m.obj = Objective(expr=expr_cov, sense=maximize)
+        set_cov_obj()
 
+        # avoid "Implicitly replacing Component" warning
+        if hasattr(m, "uniform_alloc"):
+            m.del_component(m.uniform_alloc)
         m.uniform_alloc = ConstraintList()
+
         for t in m.T:
             for i in m.I:
                 reach = [j for j in m.J if (i, j) in m.Arcs]
                 if not reach:
                     continue
-                frac = 1.0 / len(reach)
                 for j in reach:
                     if hasattr(m, "z"):
-                        m.uniform_alloc.add(m.y[i, j, t] == frac * m.z[j, t])
+                        # assignment only allowed if site open
+                        m.uniform_alloc.add(m.y[i, j, t] <= m.z[j, t])
                     else:
-                        m.uniform_alloc.add(m.y[i, j, t] == frac * m.x[j, t])
+                        # fallback if z doesn't exist
+                        m.uniform_alloc.add(m.y[i, j, t] <= m.x[j, t])
         return m
 
+    # -------------------------
+    # CLOSEST ONLY (multi)
+    # -------------------------
     if name == "closest_only":
-        # remove old component to avoid Pyomo "Implicitly replacing" warning
+        # avoid "Implicitly replacing Component" warning
         if hasattr(m, "closest_only"):
             m.del_component(m.closest_only)
-
         m.closest_only = ConstraintList()
 
-        # choose open indicator (z preferred for integer/multi-charger)
+        # open indicator (z preferred for integer/multi-charger)
         def open_at(j, t):
-            if hasattr(m, "z"):
-                return m.z[j, t]
-            return m.x[j, t]
+            return m.z[j, t] if hasattr(m, "z") else m.x[j, t]
 
         # farther_of: dict keyed by (i,j) -> list of farther arcs [(ii,jj),...]
-        # add one constraint per (j,t) per anchor (i,j)
         for t in m.T:
             for (i, j), farther in farther_of.items():
-                # IMPORTANT: if farther list is empty, skip
                 if not farther:
                     continue
-
-                # sum of "farther" assignments at time t must be 0 if site j is open
-                # <= 1 - open => if open=1 then sum <=0; if open=0 then sum<=1 (inactive)
                 m.closest_only.add(
                     sum(m.y[ii, jj, t] for (ii, jj) in farther) <= 1 - open_at(j, t)
                 )
@@ -396,6 +400,9 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
         set_cov_obj()
         return m
 
+    # -------------------------
+    # CLOSEST PRIORITY (objective only)
+    # -------------------------
     if name == "closest_priority":
         _reset_obj_multi(m)
         expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
@@ -403,6 +410,9 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
         m.obj = Objective(expr=expr_cov + 1e-3 * expr_tie, sense=maximize)
         return m
 
+    # -------------------------
+    # SYSTEM OPTIMUM (objective only)
+    # -------------------------
     if name == "system_optimum":
         _reset_obj_multi(m)
         lambda_dist = 0.1
@@ -411,6 +421,9 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
         m.obj = Objective(expr=expr_cov - lambda_dist * expr_dist, sense=maximize)
         return m
 
+    # -------------------------
+    # DEFAULT
+    # -------------------------
     set_cov_obj()
     return m
 
