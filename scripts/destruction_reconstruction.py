@@ -1,11 +1,12 @@
+import time
+
 import numpy as np
 import pandas as pd
-import time
-from pathlib import Path
+from pyomo.environ import value
 from pyomo.opt import TerminationCondition
 
 from evcs.geom import build_arcs
-from evcs.model import build_base_model ,build_multi_period_model
+from evcs.model import build_base_model, build_multi_period_model
 from evcs.methods import (
     reconstruction_greedy,
     local_search,
@@ -23,8 +24,6 @@ from evcs.methods import (
 
 )
 from evcs.solve import solve_model
-from pyomo.environ import value
-from Instance import generate_instance, save_instance_npz as save_instance, load_instance_npz as load_instance
 
 
 class DRLogger:
@@ -325,12 +324,8 @@ def run_one_policy_multi(
     cumulative_install: bool = True,
     seed: int | None = None,
     verbose: bool = False,
-    greedy_variant="ring",
+    greedy_variant: str = "ring",
 ):
-    import time
-    import numpy as np
-    from pyomo.opt import TerminationCondition
-
     from evcs.model import build_multi_period_model
     from evcs.methods import (
         compute_farther,
@@ -339,17 +334,46 @@ def run_one_policy_multi(
         reassign_y_greedy_multi,
         evaluate_solution_multi,
     )
-    # assumes you already have these helpers in your project
-    # build_arcs, solve_model, and your greedy constructor (whatever you already use)
 
+    # project helpers (assumed in your repo)
+    # - build_arcs
+    # - solve_model
+    # - greedy_schedule_multi_from_variants
+
+    # -------------------------
+    # small helpers
+    # -------------------------
+    def _num(x):
+        try:
+            if x is None:
+                return np.nan
+            return float(x)
+        except Exception:
+            return np.nan
+
+    def _copy_vals(v_exact, v_start):
+        """Copy .value from v_start into v_exact for common indices."""
+        if v_exact is None or v_start is None:
+            return
+        try:
+            for k in v_exact:
+                try:
+                    vv = value(v_start[k])
+                    v_exact[k].value = vv
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # -------------------------
+    # instance sizes
+    # -------------------------
     coords_I, coords_J = inst["coords_I"], inst["coords_J"]
     M = len(coords_I)
     N = len(coords_J)
 
     # -------------------------
-    # Demand canonicalization
-    # model wants demand_IT[t][i] => shape (T, M)
-    # keep also demand_MT for any numpy eval if needed elsewhere
+    # demand canonicalization -> demand_TM shape (T, M)
     # -------------------------
     demand_arr = np.asarray(inst["demand_IT"], dtype=float)
     if demand_arr.ndim != 2:
@@ -357,24 +381,20 @@ def run_one_policy_multi(
 
     if demand_arr.shape == (T, M):
         demand_TM = demand_arr
-        demand_MT = demand_arr.T
     elif demand_arr.shape == (M, T):
         demand_TM = demand_arr.T
-        demand_MT = demand_arr
     else:
-        # try to infer T if user passed stale T
+        # infer T if stale
         if demand_arr.shape[1] == M:
             demand_TM = demand_arr
-            demand_MT = demand_arr.T
             T = int(demand_TM.shape[0])
         elif demand_arr.shape[0] == M:
-            demand_MT = demand_arr
             demand_TM = demand_arr.T
             T = int(demand_TM.shape[0])
         else:
-            raise ValueError(f"demand_IT shape {demand_arr.shape} incompatible with M={M}")
+            raise ValueError(f"demand_IT shape {demand_arr.shape} incompatible with M={M}, T={T}")
 
-    # align P_T length to T
+    # align P_T length to final T
     P_T = list(P_T)
     if len(P_T) > T:
         P_T = P_T[:T]
@@ -387,173 +407,15 @@ def run_one_policy_multi(
     distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D, forbid_self=forbid_self)
 
     # -------------------------
-    # helpers
+    # 1) GREEDY MODEL (build + schedule + assign y)
     # -------------------------
-    def _extract_mip_gap_and_bound(res, sense: str = "max"):
-        gap = None
-        best_bound = None
-        incumbent = None
+    t0 = time.perf_counter()
 
-        # best-effort from solver internals (may be None depending on backend)
-        try:
-            sm = getattr(res.solver, "_solver_model", None)
-        except Exception:
-            sm = None
-
-        if sm is not None:
-            for attr, target in [("MIPGap", "gap"), ("ObjBound", "bound"), ("ObjVal", "inc")]:
-                try:
-                    val = getattr(sm, attr, None)
-                    if val is not None:
-                        if target == "gap":
-                            gap = float(val)
-                        elif target == "bound":
-                            best_bound = float(val)
-                        else:
-                            incumbent = float(val)
-                except Exception:
-                    pass
-
-        # fallback compute if possible
-        if gap is None and (best_bound is not None) and (incumbent is not None):
-            denom = max(1.0, abs(incumbent))
-            if sense.lower().startswith("max"):
-                gap = max(0.0, (best_bound - incumbent) / denom)
-            else:
-                gap = max(0.0, (incumbent - best_bound) / denom)
-
-        return gap, best_bound, incumbent
-
-    def _any_incumbent_loaded(m):
-        # robust: check if any u variable has a numeric value
-        try:
-            for k in m.u:
-                if m.u[k].value is not None:
-                    return True
-        except Exception:
-            pass
-        return False
-
-    # -------------------------
-    # outputs (greedy placeholders)
-    # -------------------------
-    m_greedy = None
-    score_greedy = None
-
-    # EXACT solve
-    # -------------------------
-    m_exact = None
-    score_exact = None
-    time_exact = None
-    exact_termination = None
-    proven_optimal_exact = False
-    exact_gap = None
-    exact_bound = None
-    exact_incumbent_obj = None
-    exact_has_feasible = False
-
-    try:
-        m_exact = build_multi_period_model(
-            M=M, N=N, T=T,
-            in_range=in_range, Ji=Ji, Ij=Ij,
-            demand_IT=demand_TM,      # (T,M) ✅
-            Q=Q, P_T=P_T,
-            distIJ=distIJ,
-            method_name=policy,
-            max_chargers_per_site=max_chargers_per_site,
-            cumulative_install=cumulative_install,
-        )
-
-        farther_of = compute_farther(distIJ, in_range, Ji)
-        m_exact = apply_method_multi(m_exact, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
-        
-        import time
-        t0 = time.perf_counter()
-        
-        # ✅ Let solve_model load the incumbent if it can.
-        # Your solve.py supports load_solution, so use it.
-        sol = solve_model(
-            m_exact,
-            verbose=verbose,
-            time_limit=exact_time_limit,
-            mip_gap=exact_mip_gap,
-            load_solution=False,   # recommended for time-limited MIP
-        )
-
-        res = sol["res"]
-        import numpy as np
-
-        best_feas  = getattr(res, "best_feasible_objective", None)
-        best_bound = getattr(res, "best_objective_bound", None)
-
-        def _num(x):
-            try:
-                return float(x)
-            except Exception:
-                return np.nan
-
-        best_feas_f  = _num(best_feas)
-        best_bound_f = _num(best_bound)
-
-        exact_has_feasible = np.isfinite(best_feas_f)
-
-        # relative gap (if both exist)
-        exact_gap = np.nan
-        if exact_has_feasible and np.isfinite(best_bound_f):
-            denom = max(1e-9, abs(best_feas_f))
-            exact_gap = (best_bound_f - best_feas_f) / denom  # (for maximize, bound >= feas)
-
-        # termination
-        exact_term = getattr(res, "termination_condition", None)
-        best_feas = sol.get("best_feasible_objective", None)
-        best_bound = sol.get("best_objective_bound", None)
-
-        exact_gap = None
-        if best_feas is not None and best_bound is not None:
-            denom = max(1e-9, abs(best_feas))
-            exact_gap = (best_bound - best_feas) / denom   # maximize => bound >= feas
-
-        time_exact = time.perf_counter() - t0
-        
-        # termination
-        try:
-            tc = res.solver.termination_condition
-        except Exception:
-            tc = getattr(res, "termination_condition", None)
-
-        exact_termination = tc
-        proven_optimal_exact = (tc == TerminationCondition.optimal)
-
-        exact_gap, exact_bound, exact_incumbent_obj = _extract_mip_gap_and_bound(res, sense="max")
-
-        # ✅ Robust feasibility/incumbent detection:
-        # If solver loaded vars (even under time limit), treat as feasible.
-        if _any_incumbent_loaded(m_exact):
-            exact_has_feasible = True
-            # score with loaded values
-            score_exact = float(evaluate_solution_multi(m_exact, demand_TM)["covered_demand"])
-        else:
-            # no incumbent loaded => no exact score
-            exact_has_feasible = False
-            score_exact = None
-            if verbose:
-                print(f"[Exact] No incumbent values loaded. termination={tc}")
-
-    except Exception as e:
-        if verbose:
-            print("[Exact] failed:", e)
-        m_exact = None
-        score_exact = None
-        exact_has_feasible = False
-
-  
-    # -------------------------
-    # GREEDY schedule + greedy assign
-    # -------------------------
     m_g = build_multi_period_model(
         M=M, N=N, T=T,
         in_range=in_range, Ji=Ji, Ij=Ij,
-        demand_IT=demand_TM, Q=Q, P_T=P_T,
+        demand_IT=demand_TM,      # (T,M)
+        Q=Q, P_T=P_T,
         distIJ=distIJ,
         method_name=policy,
         max_chargers_per_site=max_chargers_per_site,
@@ -563,38 +425,7 @@ def run_one_policy_multi(
     farther_of = compute_farther(distIJ, in_range, Ji)
     m_g = apply_method_multi(m_g, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
 
-    # clear state
-    for t in m_g.T:
-        for j in m_g.J:
-            m_g.u[j, t].value = 0
-            m_g.x[j, t].value = 0
-            m_g.z[j, t].value = 0
-
-    # U cap (prefer model’s U)
-    U = int(m_g.U.value) if hasattr(m_g, "U") else (
-        int(max_chargers_per_site) if max_chargers_per_site is not None else int(sum(P_T))
-    )
-
-    # adjacency j -> list(i)
-    Ij_int = {}
-    for (i, j) in in_range:
-        Ij_int.setdefault(int(j), []).append(int(i))
-
-    def x_now(j, t_int):
-        if cumulative_install:
-            return sum(int(m_g.u[j, tt].value or 0) for tt in m_g.T if int(tt) <= int(t_int))
-        return int(m_g.u[j, t_int].value or 0)
-
-    t0 = time.perf_counter()
-
-
-    # =========================
-    # FAST GREEDY SCHEDULING (variant-based) via helper
-    # =========================
-
-    # choose variant (you can pass this in as an argument instead of hardcoding)
-    greedy_variant = "ring"   # ring | exp | tabu | additive | topk_random
-
+    # build greedy schedule (returns dict {(j,t): int})
     U_cap = int(m_g.U.value) if hasattr(m_g, "U") else (
         int(max_chargers_per_site) if max_chargers_per_site is not None else None
     )
@@ -609,44 +440,136 @@ def run_one_policy_multi(
         cooldown_steps=3,
         beta=0.10,
         topK=5,
-        seed=seed or 0,
+        seed=int(seed or 0),
         cumulative_install=cumulative_install,
         U=U_cap,
-        mode="aggregate_then_fill",   # or "per_period"
+        mode="aggregate_then_fill",
     )
 
-    # write schedule into model
+    # write schedule into greedy model
     for (j, t), val in U0.items():
-        m_g.u[j, t].value = int(val)
+        try:
+            m_g.u[j, t].value = int(val)
+        except Exception:
+            pass
 
-    # sync x/z from u then assign y (KEEP YOUR EXISTING CODE)
+    # sync x/z from u then assign y
     sync_solution_state(m_g, cumulative_install=cumulative_install)
     m_g = reassign_y_greedy_multi(m_g, distIJ, Ji, method_name=policy, cumulative_install=cumulative_install)
 
     score_greedy = float(evaluate_solution_multi(m_g, demand_TM)["covered_demand"])
-    time_greedy = time.perf_counter() - t0
+    time_greedy = float(time.perf_counter() - t0)
+
+    # -------------------------
+    # 2) EXACT MODEL (build + warm start + solve)
+    # -------------------------
+    m_exact = None
+    score_exact = None
+    time_exact = None
+    exact_term = None
+    proven_optimal_exact = False
+
+    best_feas_f = np.nan
+    best_bound_f = np.nan
+    exact_gap_f = np.nan
+    exact_has_feasible = False
+
+    try:
+        m_exact = build_multi_period_model(
+            M=M, N=N, T=T,
+            in_range=in_range, Ji=Ji, Ij=Ij,
+            demand_IT=demand_TM,      # (T,M)
+            Q=Q, P_T=P_T,
+            distIJ=distIJ,
+            method_name=policy,
+            max_chargers_per_site=max_chargers_per_site,
+            cumulative_install=cumulative_install,
+        )
+        farther_of = compute_farther(distIJ, in_range, Ji)
+        m_exact = apply_method_multi(m_exact, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
+
+        # --- WARM START from greedy ---
+        _copy_vals(getattr(m_exact, "u", None), getattr(m_g, "u", None))
+        _copy_vals(getattr(m_exact, "x", None), getattr(m_g, "x", None))
+        _copy_vals(getattr(m_exact, "z", None), getattr(m_g, "z", None))
+        _copy_vals(getattr(m_exact, "y", None), getattr(m_g, "y", None))  # optional but helpful
+
+        t1 = time.perf_counter()
+        # IMPORTANT: load_solution=True so vars get values when feasible exists
+        res = solve_model(
+            m_exact,
+            verbose=verbose,
+            time_limit=float(exact_time_limit),
+            mip_gap=float(exact_mip_gap),
+            load_solution=True,
+        )
+        time_exact = float(time.perf_counter() - t1)
+
+        # HiGHSResults (APPSI) typically provides these:
+        best_feas = getattr(res, "best_feasible_objective", None)
+        best_bound = getattr(res, "best_objective_bound", None)
+        best_feas_f = _num(getattr(res, "best_feasible_objective", None))
+        best_bound_f = _num(getattr(res, "best_objective_bound", None))
+
+        exact_has_feasible = np.isfinite(best_feas_f)
+
+        # termination
+        exact_term = getattr(res, "termination_condition", None)
+        proven_optimal_exact = (exact_term == TerminationCondition.optimal)
+
+        # relative gap (maximize: bound >= feasible)
+        if exact_has_feasible and np.isfinite(best_bound_f):
+            denom = max(1e-9, abs(best_feas_f))
+            exact_gap_f = (best_bound_f - best_feas_f) / denom
+        else:
+            exact_gap_f = np.nan
+
+        # compute aligned score from loaded model vars (if loaded)
+        if exact_has_feasible:
+            try:
+                score_exact = float(evaluate_solution_multi(m_exact, demand_TM)["covered_demand"])
+            except Exception:
+                score_exact = best_feas_f  # fallback
+        else:
+            score_exact = None
+
+    except Exception as e:
+        if verbose:
+            print("[Exact] failed:", repr(e))
+        m_exact = None
+        score_exact = None
+        time_exact = None
+        exact_term = None
+        proven_optimal_exact = False
+        exact_has_feasible = False
+        best_feas_f = np.nan
+        best_bound_f = np.nan
+        exact_gap_f = np.nan
 
     return dict(
         policy=policy,
         greedy_variant=greedy_variant,
-        m_best=m_g,
+
+        m_best=m_g,          # greedy best you start from
         m_greedy=m_g,
         score_greedy=score_greedy,
+        time_greedy=time_greedy,
+
         m_exact=m_exact,
         score_exact=score_exact,
         proven_optimal_exact=bool(proven_optimal_exact),
         time_exact=time_exact,
+
         distIJ=distIJ,
         in_range=in_range,
         Ji=Ji,
         Ij=Ij,
+
         exact_has_feasible=bool(exact_has_feasible),
-        exact_incumbent_obj=best_feas_f if exact_has_feasible else None,
-        exact_bound=best_bound_f if np.isfinite(best_bound_f) else None,
-        exact_gap=exact_gap if np.isfinite(exact_gap) else None,
+        exact_incumbent_obj=(float(best_feas_f) if np.isfinite(best_feas_f) else None),
+        exact_bound=(float(best_bound_f) if np.isfinite(best_bound_f) else None),
+        exact_gap=(float(exact_gap_f) if np.isfinite(exact_gap_f) else None),
         exact_termination=exact_term,
-
-
     )
 
 # =========================================================
@@ -663,8 +586,6 @@ def _clone_u_matrix(m):
 
 
 def _apply_u_matrix(m, Udict):
-    Q = float(m.Q.value)
-
     """Write dict {(j,t): int} back into m.u[j,t]."""
     for j in m.J:
         jj = int(j)
@@ -672,10 +593,6 @@ def _apply_u_matrix(m, Udict):
             tt = int(t)
             m.u[j, t].value = int(Udict.get((jj, tt), 0))
 
-
-import numpy as np
-
-import numpy as np
 
 def destroy_multi_u(
     Udict,
@@ -1158,63 +1075,19 @@ def reconstruct_u_dict_fast(
 
 def _u_to_capacity_array(U_dict, T, N, Q_cap, cumulative_install=True):
     """
-    Convert U_dict[(t,j)] = chargers installed at period t at site j
-    into cap[t,j] = demand-capacity (chargers * Q_cap), optionally cumulative over time.
+    Convert U_dict[(j,t)] = chargers installed at period t at site j
+    into cap[t,j] = demand capacity (chargers * Q_cap), optionally cumulative over time.
     """
-    import numpy as np
     cap = np.zeros((T, N), dtype=float)
-    for (t, j), val in U_dict.items():
-        t = int(t); j = int(j)
-        if 0 <= t < T and 0 <= j < N:
-            cap[t, j] += float(val) * float(Q_cap)
-    if cumulative_install:
-        cap = np.cumsum(cap, axis=0)
-    return cap
-
-
-def evaluate_u_numpy_greedy(
-    U_dict,
-    demand_IT,
-    J_i_list,
-    distIJ,
-    Q_cap,
-    T,
-    N,
-    cumulative_install=True,
-    pre_sorted_J_i=None,   # optional: list of sorted feasible sites for each i
-):
-    """
-    Greedy evaluation: allocate each user's demand to nearest feasible sites with remaining capacity.
-    Returns covered_demand (float).
-
-    - demand_IT assumed indexable like demand_IT[i, t]
-    - distIJ can be dict[(i,j)] or array distIJ[i,j]
-    - U_dict keys assumed (t,j) chargers installed at t at site j
-    """
-
-
-# -------------------------
-# Helpers (put ABOVE run_DR_multi)
-# -------------------------
-import numpy as np
-
-def _u_to_capacity_array(U_dict, T, N, Q_cap, cumulative_install=True):
-    """
-    U_dict[(j,t)] = chargers installed at period t at site j
-    -> cap[t,j]   = capacity at period t at site j (chargers * Q_cap)
-    """
-    import numpy as np
-    cap = np.zeros((T, N), dtype=float)
-
     for (j, t), val in U_dict.items():
-        j = int(j); t = int(t)
+        j = int(j)
+        t = int(t)
         if 0 <= t < T and 0 <= j < N:
             cap[t, j] += float(val) * float(Q_cap)
-
     if cumulative_install:
         cap = np.cumsum(cap, axis=0)
-
     return cap
+
 
 def evaluate_u_numpy_greedy(
     U_dict,
@@ -1228,13 +1101,10 @@ def evaluate_u_numpy_greedy(
     pre_sorted_J_i=None,
 ):
     """
-    Greedy evaluation: allocate each user's demand to nearest feasible sites with remaining capacity.
-    Returns covered_demand (float).
+    Greedy evaluation with demand splitting across feasible sites subject to capacity.
 
-    Notes:
-    - demand_IT assumed indexable as demand_IT[i, t]
-    - distIJ can be dict[(i,j)] or array distIJ[i,j]
-    - U_dict keys assumed (t,j) chargers installed at t at site j
+    Expected demand orientation: demand_IT[i, t] (shape (M, T)).
+    U_dict keys are assumed to be (j, t).
     """
     cap = _u_to_capacity_array(U_dict, T=T, N=N, Q_cap=Q_cap, cumulative_install=cumulative_install)
 
@@ -1246,8 +1116,7 @@ def evaluate_u_numpy_greedy(
         cap_t = cap[t].copy()
 
         for i in range(M):
-            d = float(demand_IT[i, t]) if isinstance(demand_IT, list) else float(demand_IT[i, t])
-
+            d = float(demand_IT[i, t])
             if d <= 1e-12:
                 continue
 
@@ -1258,10 +1127,7 @@ def evaluate_u_numpy_greedy(
             if pre_sorted_J_i is not None:
                 js_sorted = pre_sorted_J_i[i]
             else:
-                js_sorted = sorted(
-                    js,
-                    key=lambda j: distIJ[(i, j)] if is_dict else distIJ[i, j]
-                )
+                js_sorted = sorted(js, key=lambda j: distIJ[(i, j)] if is_dict else distIJ[i, j])
 
             remaining = d
             for j in js_sorted:
@@ -1277,28 +1143,11 @@ def evaluate_u_numpy_greedy(
 
     return float(covered)
 
-import numpy as np
-
-def _u_to_capacity_array_jt(U_dict, T, N, Q_cap, cumulative_install=True):
-    """
-    U_dict[(j,t)] = chargers installed at period t at site j
-    -> cap[t,j] = (chargers * Q_cap), optionally cumulative over time.
-    """
-    cap = np.zeros((T, N), dtype=float)
-    for (j, t), val in U_dict.items():
-        j = int(j); t = int(t)
-        if 0 <= t < T and 0 <= j < N:
-            cap[t, j] += float(val) * float(Q_cap)
-
-    if cumulative_install:
-        cap = np.cumsum(cap, axis=0)
-    return cap
-
 
 def evaluate_u_numpy_greedy_jt(
     U_dict,
-    demand_MT,        # (M,T)
-    pre_sorted_J_i,   # list length M, each is feasible sites sorted by dist
+    demand_MT,
+    pre_sorted_J_i,
     Q_cap,
     T,
     N,
@@ -1306,10 +1155,10 @@ def evaluate_u_numpy_greedy_jt(
 ):
     """
     Greedy multi-source allocation with capacities.
-    Uses U_dict keys (j,t).
-    Returns covered demand (float).
+    Uses U_dict keys (j, t) and demand_MT shape (M, T).
+    Returns total covered demand (float).
     """
-    cap = _u_to_capacity_array_jt(U_dict, T=T, N=N, Q_cap=Q_cap, cumulative_install=cumulative_install)
+    cap = _u_to_capacity_array(U_dict, T=T, N=N, Q_cap=Q_cap, cumulative_install=cumulative_install)
 
     covered = 0.0
     M = int(demand_MT.shape[0])
@@ -1340,26 +1189,25 @@ def evaluate_u_numpy_greedy_jt(
 
     return float(covered)
 
+
 def evaluate_u_numpy_greedy_binary(
     U_dict,
-    demand_TM,          # shape (T, M)  demand_TM[t][i]
-    J_i_list,           # list length M, each is list of feasible sites j
+    demand_TM,
+    J_i_list,
     distIJ,
     Q_cap,
     T,
     N,
     cumulative_install=True,
-    pre_sorted_J_i=None
+    pre_sorted_J_i=None,
 ):
     """
-    Greedy evaluation that matches the typical binary assignment idea:
-    each (i,t) is either fully covered by ONE site or not covered.
+    Greedy evaluation that matches a binary assignment interpretation:
+    each (i,t) is either fully covered by one site or not covered.
     No demand splitting across multiple sites.
 
-    Returns total covered demand (float).
+    Expected demand orientation: demand_TM[t][i] (shape (T, M)).
     """
-    import numpy as np
-
     cap = _u_to_capacity_array(U_dict, T=T, N=N, Q_cap=Q_cap, cumulative_install=cumulative_install)
     covered = 0.0
     M = len(J_i_list)
@@ -1382,7 +1230,6 @@ def evaluate_u_numpy_greedy_binary(
             else:
                 js_sorted = sorted(js, key=lambda j: distIJ[(i, j)] if is_dict else distIJ[i, j])
 
-            # assign to first site with enough remaining capacity to cover full demand
             for j in js_sorted:
                 if cap_t[j] + 1e-12 >= d:
                     cap_t[j] -= d
@@ -1424,11 +1271,6 @@ def run_DR_multi(
     # reconstruction diversity knobs
     top_k_choice: int = 3,
 ):
-    import time
-    import numpy as np
-    import pandas as pd
-    from pyomo.environ import value
-
     rng = np.random.default_rng(seed if seed is not None else 0)
 
     coords_I, coords_J = inst["coords_I"], inst["coords_J"]
@@ -1514,16 +1356,53 @@ def run_DR_multi(
     # -------------------------------------------------
     # Initial greedy + exact passthrough
     # -------------------------------------------------
-    base_out = run_one_policy_multi(
-        inst=inst, policy=policy, P_T=P_T, Q=Q, D=D, T=T,
-        exact_time_limit=exact_time_limit, exact_mip_gap=exact_mip_gap,
-        max_chargers_per_site=max_chargers_per_site,
-        cumulative_install=cumulative_install,
-        seed=seed, verbose=verbose
+        # -------------------------------------------------
+    # Initial greedy ONLY (no exact solve)
+    # -------------------------------------------------
+    from evcs.methods import (
+        compute_farther,
+        apply_method_multi,
+        sync_solution_state,
+        reassign_y_greedy_multi,
+        evaluate_solution_multi,
+        greedy_schedule_multi_from_variants,
     )
 
-    # start from greedy solution U
-    m0 = base_out["m_best"]
+    # build a greedy initial multi-period schedule U0
+    U0 = greedy_schedule_multi_from_variants(
+        inst=inst,
+        P_T=P_T,
+        D_cover=D,
+        variant="ring",
+        seed=(seed or 0),
+        cumulative_install=cumulative_install,
+        U=max_chargers_per_site,
+        mode="aggregate_then_fill",
+    )
+
+    # inject greedy U0 into template model
+    m0 = m_template.clone()
+    for (j, t), val in U0.items():
+        try:
+            m0.u[j, t].value = int(val)
+        except Exception:
+            pass
+
+    # sync x/z from u
+    sync_solution_state(m0, cumulative_install=cumulative_install)
+
+    # rebuild greedy y assignment on the model
+    reassign_y_greedy_multi(
+        m0,
+        policy=policy,
+        distIJ=distIJ,
+        in_range=in_range,
+        Ji=Ji,
+        Ij=Ij,
+        verbose=False,
+    )
+
+    # start DR from greedy solution U
     U_curr = _clone_u_matrix(m0)
 
     # DR proxy state (fast, consistent with capacity/binary assignment)
@@ -1992,19 +1871,7 @@ def run_DR_multi(
                                     cumulative_install=cumulative_install)
         cov = covered_by_period(m, inst)
         return float(np.sum(cov))
-    # ------------------------------
-    # Exact (aligned metric: same as DR)
-
     inst_tag = str(inst.get("meta", {}).get("tag", ""))
-    m_exact = base_out.get("m_exact", None)
-
-    exact_score = None
-    exact_raw_obj = None
-
-    if m_exact is not None and base_out.get("exact_has_feasible", False):
-        exact_score = float(full_eval_model(m_exact))          # aligned metric
-        exact_raw_obj = float(value(m_exact.obj))              # debug only
-
     return dict(
         inst_tag=inst_tag,
         policy=policy,
@@ -2014,15 +1881,16 @@ def run_DR_multi(
         U_best=dict(U_best_full),
         DR_best_total_eval=float(best_full_score),
 
-        # exact (aligned)
-        m_exact=m_exact,
-        exact_score=float(exact_score) if exact_score is not None else None,
-        exact_raw_obj=float(exact_raw_obj) if exact_raw_obj is not None else None,
-        exact_has_feasible=bool(base_out.get("exact_has_feasible", False)),
-        time_exact=base_out.get("time_exact", None),
-        exact_termination=base_out.get("exact_termination", None),
-        exact_gap=base_out.get("exact_gap", None),
-        proven_optimal=base_out.get("proven_optimal_exact", False),
+    
+        # exact is handled outside DR in the notebook
+        m_exact=None,
+        exact_score=None,
+        exact_raw_obj=None,
+        exact_has_feasible=None,
+        time_exact=None,
+        exact_termination=None,
+        exact_gap=None,
+        proven_optimal=None,
 
         # logs
         DR_log=logger.to_df(),

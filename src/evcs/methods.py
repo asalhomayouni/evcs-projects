@@ -156,6 +156,47 @@ def total_chargers(m) -> int:
     return sum(charger_count(m, j) for j in m.J)
 
 
+def _delete_component_if_exists(m, name: str):
+    if hasattr(m, name):
+        try:
+            m.del_component(getattr(m, name))
+        except Exception:
+            m.del_component(name)
+
+
+def _set_coverage_objective_single(m):
+    _delete_component_if_exists(m, "obj")
+    expr_cov = sum(m.a[i] * m.y[i, j] for (i, j) in m.Arcs)
+    m.obj = Objective(expr=expr_cov, sense=maximize)
+    return m.obj
+
+
+def _set_coverage_objective_multi(m):
+    _delete_component_if_exists(m, "obj")
+    expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
+    m.obj = Objective(expr=expr_cov, sense=maximize)
+    return m.obj
+
+
+def _distance_getter(distIJ):
+    def dij(i, j):
+        try:
+            return float(distIJ[(i, j)])
+        except Exception:
+            try:
+                return float(distIJ[i, j])
+            except Exception:
+                return float(distIJ[i][j])
+    return dij
+
+
+def _build_reachable_from_arcs(arcs):
+    Ji = {}
+    for (i, j) in arcs:
+        Ji.setdefault(int(i), []).append(int(j))
+    return Ji
+
+
 # =========================================================
 # Evaluation (single + multi)
 # =========================================================
@@ -170,8 +211,6 @@ def evaluate_solution(m, distIJ, demand_I, method_name="closest_only"):
 
     cov_pct = 100.0 * covered / total_demand if total_demand > 0 else 0.0
     return {"covered_demand": covered, "covered_pct": cov_pct}
-
-from pyomo.environ import value
 
 def evaluate_policy_objective_multi(m, demand_IT, distIJ=None, method_name="closest_only"):
     """
@@ -250,13 +289,11 @@ def compute_farther(distIJ, in_range, Ji):
 
 
 def _reset_obj_single(m):
-    if hasattr(m, "obj"):
-        m.del_component("obj")
+    _delete_component_if_exists(m, "obj")
 
 
 def _reset_obj_multi(m):
-    if hasattr(m, "obj"):
-        m.del_component("obj")
+    _delete_component_if_exists(m, "obj")
 
 
 def add_closest_only(m, farther_of):
@@ -291,8 +328,7 @@ def add_uniform_allocation_constraints(m):
     m.obj = Objective(expr=expr_cov, sense=maximize)
 
     # prevent Pyomo "Implicitly replacing Component" warning
-    if hasattr(m, "uniform_alloc"):
-        m.del_component(m.uniform_alloc)
+    _delete_component_if_exists(m, "uniform_alloc")
     m.uniform_alloc = ConstraintList()
     for i in m.I:
         reach = [j for j in m.J if (i, j) in m.Arcs]
@@ -318,9 +354,7 @@ def apply_method(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=F
 
     if name == "closest_only":
         add_closest_only(m, farther_of)
-        _reset_obj_single(m)
-        expr_cov = sum(m.a[i] * m.y[i, j] for (i, j) in m.Arcs)
-        m.obj = Objective(expr=expr_cov, sense=maximize)
+        _set_coverage_objective_single(m)
         return m
 
     if name == "closest_priority":
@@ -329,9 +363,7 @@ def apply_method(m, method_name, distIJ, in_range, Ji, Ij, farther_of, verbose=F
     if name == "system_optimum":
         return add_system_optimum(m, distIJ, lambda_dist=0.1)
 
-    _reset_obj_single(m)
-    expr_cov = sum(m.a[i] * m.y[i, j] for (i, j) in m.Arcs)
-    m.obj = Objective(expr=expr_cov, sense=maximize)
+    _set_coverage_objective_single(m)
     return m
 
 
@@ -346,9 +378,7 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
     name = str(method_name).lower()
 
     def set_cov_obj():
-        _reset_obj_multi(m)
-        expr_cov = sum(m.a[i, t] * m.y[i, j, t] for (i, j) in m.Arcs for t in m.T)
-        m.obj = Objective(expr=expr_cov, sense=maximize)
+        _set_coverage_objective_multi(m)
 
     # -------------------------
     # UNIFORM
@@ -357,8 +387,7 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
         set_cov_obj()
 
         # avoid "Implicitly replacing Component" warning
-        if hasattr(m, "uniform_alloc"):
-            m.del_component(m.uniform_alloc)
+        _delete_component_if_exists(m, "uniform_alloc")
         m.uniform_alloc = ConstraintList()
 
         for t in m.T:
@@ -380,8 +409,7 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
     # -------------------------
     if name == "closest_only":
         # avoid "Implicitly replacing Component" warning
-        if hasattr(m, "closest_only"):
-            m.del_component(m.closest_only)
+        _delete_component_if_exists(m, "closest_only")
         m.closest_only = ConstraintList()
 
         # open indicator (z preferred for integer/multi-charger)
@@ -478,8 +506,6 @@ def reassign_y_greedy(m, distIJ, Ji, method_name: str):
     return m
 
 
-import random
-
 def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install: bool = True):
     """
     Multi-period greedy assignment (BINARY y).
@@ -495,8 +521,6 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
       - uniform
       - default: best-fit (tight fill)
     """
-    import random
-
     # make sure x/z etc are consistent with u (and cumulative_install)
     sync_solution_state(m, cumulative_install=cumulative_install)
 
@@ -506,10 +530,7 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
     Q = float(value(m.Q))
 
     # --- adjacency: reachable sites per i from Arcs ---
-    Ji_int = {}
-    for (i, j) in m.Arcs:
-        ii, jj = int(i), int(j)
-        Ji_int.setdefault(ii, []).append(jj)
+    Ji_int = _build_reachable_from_arcs(m.Arcs)
 
     # --- clear y ---
     for (i, j) in m.Arcs:
@@ -518,14 +539,7 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
             m.y[ii, jj, tt].value = 0
 
     # robust distance getter (works for dict, ndarray, nested list)
-    def dij(ii_, jj_):
-        try:
-            return float(distIJ[(ii_, jj_)])
-        except Exception:
-            try:
-                return float(distIJ[ii_, jj_])
-            except Exception:
-                return float(distIJ[ii_][jj_])
+    dij = _distance_getter(distIJ)
 
     name = str(method_name).lower().strip()
 
@@ -591,8 +605,6 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
 # =========================================================
 # Simplified Greedy Initializers (FAST variants A–E)
 # =========================================================
-import numpy as np
-
 def _pairwise_dist(A, B):
     A = np.asarray(A, dtype=float)
     B = np.asarray(B, dtype=float)
@@ -869,10 +881,7 @@ def greedy_schedule_multi_from_variants(
 # Initial solution helper (kept; minimal cleanup)
 # =========================================================
 def _build_Ji_from_arcs(m):
-    Ji = {}
-    for (i, j) in m.Arcs:
-        Ji.setdefault(int(i), []).append(int(j))
-    return Ji
+    return _build_reachable_from_arcs(m.Arcs)
 
 
 def build_initial_solution_weighted(model, distIJ, demand_I, method_name="closest_only", weight_mode="W1"):
@@ -1294,7 +1303,6 @@ def greedy_add_missing_units_binary(model, demand_I, weight_mode, k_add, rng=Non
       - "W1": total reachable demand from site j
       - "W2": demand / (1 + #already-open sites that share demand coverage with j)  [overlap-based "near"]
     """
-    import numpy as np
     if rng is None:
         rng = np.random.default_rng(0)
 

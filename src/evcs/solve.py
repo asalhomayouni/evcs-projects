@@ -1,73 +1,59 @@
 # src/evcs/solve.py
+from __future__ import annotations
+
 import os
-from pyomo.contrib.appsi.solvers import Highs
-from pyomo.opt import TerminationCondition
+
+from pyomo.contrib.appsi.solvers.highs import Highs
+
+
+def _safe_set_config(opt: Highs, attr: str, value) -> None:
+    """Best-effort setter for APPsi HiGHS config fields."""
+    try:
+        setattr(opt.config, attr, value)
+    except Exception:
+        pass
+
 
 def solve_model(
     m,
-    time_limit=300,     # seconds
-    mip_gap=0.01,       # relative MIP gap
-    threads=None,       # default: all cores - 1
+    time_limit=300,
+    mip_gap=0.01,
+    threads=None,
     presolve=True,
     verbose=False,
-    load_solution=True,  # ✅ NEW: control auto-loading
+    load_solution=True,
 ):
+    """Solve a Pyomo model with APPsi HiGHS.
+
+    Keeps the public signature unchanged for compatibility with the rest of the
+    project skeleton.
+    """
     opt = Highs()
 
-    # Configure solver options safely
-    def safe_set(attr, value):
-        try:
-            setattr(opt.config, attr, value)
-        except Exception:
-            pass
+    n_threads = threads
+    if n_threads is None:
+        n_threads = max(1, (os.cpu_count() or 2) - 1)
 
-    # stream output
-    safe_set("stream_solver", bool(verbose))
+    _safe_set_config(opt, "stream_solver", bool(verbose))
+    _safe_set_config(opt, "time_limit", float(time_limit))
+    _safe_set_config(opt, "mip_rel_gap", float(mip_gap))
+    _safe_set_config(opt, "threads", int(n_threads))
+    _safe_set_config(opt, "presolve", "on" if presolve else "off")
 
-    if threads is None:
-        threads = max(1, (os.cpu_count() or 2) - 1)
+    # Do not auto-load blindly. We only load if a feasible incumbent exists.
+    _safe_set_config(opt, "load_solution", False)
 
-    # Apply solver options
-    safe_set("time_limit", float(time_limit))
-    safe_set("mip_rel_gap", float(mip_gap))
-    safe_set("threads", int(threads))
-    safe_set("presolve", "on" if presolve else "off")
-
-    # ✅ IMPORTANT: prevent "feasible but suboptimal" auto-load warning
-    safe_set("load_solution", bool(load_solution))
-
-    # Solve model
     res = opt.solve(m)
 
-    # DEBUG: inspect what res contains
-    print("RES TYPE:", type(res))
-    print("RES DIR sample:", [x for x in dir(res) if "gap" in x.lower() or "bound" in x.lower() or "obj" in x.lower()][:50])
-    
-    # Optional: load into model
     if load_solution:
         try:
-            if hasattr(res, "solution_loader") and res.solution_loader is not None:
+            has_feasible = (
+                hasattr(res, "best_feasible_objective")
+                and res.best_feasible_objective is not None
+            )
+            if has_feasible and hasattr(res, "solution_loader") and res.solution_loader is not None:
                 res.solution_loader.load_vars()
         except Exception:
             pass
 
-        # Extract incumbent + bound when available (HiGHS MIP)
-    best_feas = None
-    best_bound = None
-    try:
-        best_feas = float(res.best_feasible_objective)
-    except Exception:
-        pass
-    try:
-        best_bound = float(res.best_objective_bound)
-    except Exception:
-        pass
-
-    return {
-        "res": res,
-        "termination": getattr(res, "termination_condition", None),
-        "best_feasible_objective": best_feas,
-        "best_objective_bound": best_bound,
-    }
-
-
+    return res
