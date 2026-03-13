@@ -127,7 +127,7 @@ def run_one_policy(
     # =================================================
     # 1) EXACT baseline
     # =================================================
-    score_exact = np.nan
+    exact_score_aligned = np.nan
     time_exact = np.nan
     optimal_exact = False
     m_exact = None
@@ -145,7 +145,7 @@ def run_one_policy(
             mip_gap=exact_mip_gap
         )
         time_exact = time.perf_counter() - t0
-        score_exact = evaluate_solution(m_exact, distIJ, demand_I, method_name=policy)["covered_demand"]
+        exact_score_aligned= evaluate_solution(m_exact, distIJ, demand_I, method_name=policy)["covered_demand"]
         optimal_exact = (getattr(res, "termination_condition", None) == TerminationCondition.optimal)
     except Exception as e:
         print(f"⚠️ Exact solve failed/skipped: {e}")
@@ -297,7 +297,7 @@ def run_one_policy(
 
     return dict(
         policy=policy,
-        score_exact=score_exact,
+        exact_score_aligned=exact_score_aligned,
         time_exact=time_exact,
         optimal_exact=optimal_exact,
         score_greedy=score_greedy,
@@ -326,6 +326,11 @@ def run_one_policy_multi(
     verbose: bool = False,
     greedy_variant: str = "ring",
 ):
+    import time
+    import numpy as np
+    from pyomo.environ import value
+    from pyomo.opt import TerminationCondition
+
     from evcs.model import build_multi_period_model
     from evcs.methods import (
         compute_farther,
@@ -333,12 +338,8 @@ def run_one_policy_multi(
         sync_solution_state,
         reassign_y_greedy_multi,
         evaluate_solution_multi,
+        evaluate_policy_objective_multi,
     )
-
-    # project helpers (assumed in your repo)
-    # - build_arcs
-    # - solve_model
-    # - greedy_schedule_multi_from_variants
 
     # -------------------------
     # small helpers
@@ -352,7 +353,6 @@ def run_one_policy_multi(
             return np.nan
 
     def _copy_vals(v_exact, v_start):
-        """Copy .value from v_start into v_exact for common indices."""
         if v_exact is None or v_start is None:
             return
         try:
@@ -384,7 +384,6 @@ def run_one_policy_multi(
     elif demand_arr.shape == (M, T):
         demand_TM = demand_arr.T
     else:
-        # infer T if stale
         if demand_arr.shape[1] == M:
             demand_TM = demand_arr
             T = int(demand_TM.shape[0])
@@ -394,7 +393,6 @@ def run_one_policy_multi(
         else:
             raise ValueError(f"demand_IT shape {demand_arr.shape} incompatible with M={M}, T={T}")
 
-    # align P_T length to final T
     P_T = list(P_T)
     if len(P_T) > T:
         P_T = P_T[:T]
@@ -407,14 +405,14 @@ def run_one_policy_multi(
     distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D, forbid_self=forbid_self)
 
     # -------------------------
-    # 1) GREEDY MODEL (build + schedule + assign y)
+    # 1) GREEDY
     # -------------------------
     t0 = time.perf_counter()
 
     m_g = build_multi_period_model(
         M=M, N=N, T=T,
         in_range=in_range, Ji=Ji, Ij=Ij,
-        demand_IT=demand_TM,      # (T,M)
+        demand_IT=demand_TM,
         Q=Q, P_T=P_T,
         distIJ=distIJ,
         method_name=policy,
@@ -425,7 +423,6 @@ def run_one_policy_multi(
     farther_of = compute_farther(distIJ, in_range, Ji)
     m_g = apply_method_multi(m_g, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
 
-    # build greedy schedule (returns dict {(j,t): int})
     U_cap = int(m_g.U.value) if hasattr(m_g, "U") else (
         int(max_chargers_per_site) if max_chargers_per_site is not None else None
     )
@@ -446,56 +443,60 @@ def run_one_policy_multi(
         mode="aggregate_then_fill",
     )
 
-    # write schedule into greedy model
     for (j, t), val in U0.items():
         try:
             m_g.u[j, t].value = int(val)
         except Exception:
             pass
 
-    # sync x/z from u then assign y
     sync_solution_state(m_g, cumulative_install=cumulative_install)
-    m_g = reassign_y_greedy_multi(m_g, distIJ, Ji, method_name=policy, cumulative_install=cumulative_install)
+    m_g = reassign_y_greedy_multi(
+        m_g, distIJ, Ji,
+        method_name=policy,
+        cumulative_install=cumulative_install
+    )
 
     score_greedy = float(evaluate_solution_multi(m_g, demand_TM)["covered_demand"])
     time_greedy = float(time.perf_counter() - t0)
 
     # -------------------------
-    # 2) EXACT MODEL (build + warm start + solve)
+    # 2) EXACT
     # -------------------------
     m_exact = None
-    score_exact = None
+    exact_score_aligned = None
+    exact_incumbent_obj_raw = None
+    exact_bound_raw = None
+    exact_gap_raw = None
     time_exact = None
     exact_term = None
     proven_optimal_exact = False
-
-    best_feas_f = np.nan
-    best_bound_f = np.nan
-    exact_gap_f = np.nan
     exact_has_feasible = False
+
+    best_bound_f = np.nan
 
     try:
         m_exact = build_multi_period_model(
             M=M, N=N, T=T,
             in_range=in_range, Ji=Ji, Ij=Ij,
-            demand_IT=demand_TM,      # (T,M)
+            demand_IT=demand_TM,
             Q=Q, P_T=P_T,
             distIJ=distIJ,
             method_name=policy,
             max_chargers_per_site=max_chargers_per_site,
             cumulative_install=cumulative_install,
         )
-        farther_of = compute_farther(distIJ, in_range, Ji)
-        m_exact = apply_method_multi(m_exact, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False)
 
-        # --- WARM START from greedy ---
+        farther_of = compute_farther(distIJ, in_range, Ji)
+        m_exact = apply_method_multi(
+            m_exact, policy, distIJ, in_range, Ji, Ij, farther_of, verbose=False
+        )
+
         _copy_vals(getattr(m_exact, "u", None), getattr(m_g, "u", None))
         _copy_vals(getattr(m_exact, "x", None), getattr(m_g, "x", None))
         _copy_vals(getattr(m_exact, "z", None), getattr(m_g, "z", None))
-        _copy_vals(getattr(m_exact, "y", None), getattr(m_g, "y", None))  # optional but helpful
+        _copy_vals(getattr(m_exact, "y", None), getattr(m_g, "y", None))
 
         t1 = time.perf_counter()
-        # IMPORTANT: load_solution=True so vars get values when feasible exists
         res = solve_model(
             m_exact,
             verbose=verbose,
@@ -505,58 +506,77 @@ def run_one_policy_multi(
         )
         time_exact = float(time.perf_counter() - t1)
 
-        # HiGHSResults (APPSI) typically provides these:
-        best_feas = getattr(res, "best_feasible_objective", None)
-        best_bound = getattr(res, "best_objective_bound", None)
-        best_feas_f = _num(getattr(res, "best_feasible_objective", None))
         best_bound_f = _num(getattr(res, "best_objective_bound", None))
-
-        exact_has_feasible = np.isfinite(best_feas_f)
-
-        # termination
         exact_term = getattr(res, "termination_condition", None)
         proven_optimal_exact = (exact_term == TerminationCondition.optimal)
 
-        # relative gap (maximize: bound >= feasible)
-        if exact_has_feasible and np.isfinite(best_bound_f):
-            denom = max(1e-9, abs(best_feas_f))
-            exact_gap_f = (best_bound_f - best_feas_f) / denom
-        else:
-            exact_gap_f = np.nan
+        # Feasibility: trust loaded vars/model, not best_feasible_objective
+        try:
+            sample = None
+            if hasattr(m_exact, "u"):
+                sample = m_exact.u[0, 0].value
+            exact_has_feasible = (sample is not None)
+        except Exception:
+            exact_has_feasible = False
 
-        # compute aligned score from loaded model vars (if loaded)
         if exact_has_feasible:
-            try:
-                score_exact = float(evaluate_solution_multi(m_exact, demand_TM)["covered_demand"])
-            except Exception:
-                score_exact = best_feas_f  # fallback
-        else:
-            score_exact = None
+            # aligned metric = covered demand only
+            exact_score_aligned = float(
+                evaluate_solution_multi(m_exact, demand_TM)["covered_demand"]
+            )
+
+            # raw metric = same objective as the MIP policy objective
+            exact_incumbent_obj_raw = float(
+                evaluate_policy_objective_multi(
+                    m_exact, demand_TM, distIJ=distIJ, method_name=policy
+                )
+            )
+
+        if np.isfinite(best_bound_f):
+            exact_bound_raw = float(best_bound_f)
+
+        if (
+            exact_incumbent_obj_raw is not None
+            and exact_bound_raw is not None
+            and abs(exact_incumbent_obj_raw) > 1e-9
+        ):
+            ratio = abs(exact_bound_raw / exact_incumbent_obj_raw)
+            if 0.01 <= ratio <= 100:
+                exact_gap_raw = (
+                    exact_bound_raw - exact_incumbent_obj_raw
+                ) / abs(exact_incumbent_obj_raw)
+            else:
+                exact_gap_raw = None
 
     except Exception as e:
         if verbose:
             print("[Exact] failed:", repr(e))
         m_exact = None
-        score_exact = None
+        exact_score_aligned = None
+        exact_incumbent_obj_raw = None
+        exact_bound_raw = None
+        exact_gap_raw = None
         time_exact = None
         exact_term = None
         proven_optimal_exact = False
         exact_has_feasible = False
-        best_feas_f = np.nan
-        best_bound_f = np.nan
-        exact_gap_f = np.nan
 
     return dict(
         policy=policy,
         greedy_variant=greedy_variant,
 
-        m_best=m_g,          # greedy best you start from
+        m_best=m_g,
         m_greedy=m_g,
         score_greedy=score_greedy,
         time_greedy=time_greedy,
 
         m_exact=m_exact,
-        score_exact=score_exact,
+        exact_score_aligned=exact_score_aligned,
+        exact_incumbent_obj_raw=exact_incumbent_obj_raw,
+        exact_bound_raw=exact_bound_raw,
+        exact_gap_raw=exact_gap_raw,
+        exact_has_feasible=bool(exact_has_feasible),
+        exact_termination=exact_term,
         proven_optimal_exact=bool(proven_optimal_exact),
         time_exact=time_exact,
 
@@ -564,14 +584,7 @@ def run_one_policy_multi(
         in_range=in_range,
         Ji=Ji,
         Ij=Ij,
-
-        exact_has_feasible=bool(exact_has_feasible),
-        exact_incumbent_obj=(float(best_feas_f) if np.isfinite(best_feas_f) else None),
-        exact_bound=(float(best_bound_f) if np.isfinite(best_bound_f) else None),
-        exact_gap=(float(exact_gap_f) if np.isfinite(exact_gap_f) else None),
-        exact_termination=exact_term,
     )
-
 # =========================================================
 # Priority-2: Multi-period DR (Destroy / Reconstruct / Loop)
 # =========================================================
@@ -1355,18 +1368,7 @@ def run_DR_multi(
 
     # -------------------------------------------------
     # Initial greedy + exact passthrough
-    # -------------------------------------------------
-        # -------------------------------------------------
-    # Initial greedy ONLY (no exact solve)
-    # -------------------------------------------------
-    from evcs.methods import (
-        compute_farther,
-        apply_method_multi,
-        sync_solution_state,
-        reassign_y_greedy_multi,
-        evaluate_solution_multi,
-        greedy_schedule_multi_from_variants,
-    )
+
 
     # build a greedy initial multi-period schedule U0
     U0 = greedy_schedule_multi_from_variants(
@@ -1392,14 +1394,12 @@ def run_DR_multi(
     sync_solution_state(m0, cumulative_install=cumulative_install)
 
     # rebuild greedy y assignment on the model
-    reassign_y_greedy_multi(
+    m0 = reassign_y_greedy_multi(
         m0,
-        policy=policy,
-        distIJ=distIJ,
-        in_range=in_range,
-        Ji=Ji,
-        Ij=Ij,
-        verbose=False,
+        distIJ,
+        Ji,
+        method_name=policy,
+        cumulative_install=cumulative_install,
     )
 
     # start DR from greedy solution U
