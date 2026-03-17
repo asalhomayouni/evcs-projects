@@ -249,6 +249,44 @@ def evaluate_policy_objective_multi(m, demand_IT, distIJ=None, method_name="clos
     # closest_only / default / uniform => coverage objective in your code
     return cov
 
+
+def evaluate_u_full_policy_objective_multi(
+    U_dict,
+    m_template,
+    distIJ,
+    demand_IT,
+    method_name="closest_only",
+    cumulative_install=True,
+):
+    """
+    Full model evaluation of a U-dict under the SAME objective scale
+    as the exact MIP policy objective.
+    """
+    from copy import deepcopy
+
+    m = m_template.clone()
+
+    for j in m.J:
+        for t in m.T:
+            m.u[j, t].value = int(U_dict.get((int(j), int(t)), 0))
+
+    sync_solution_state(m, cumulative_install=cumulative_install)
+    m = reassign_y_greedy_multi(
+        m,
+        distIJ,
+        Ji=None,
+        method_name=method_name,
+        cumulative_install=cumulative_install,
+    )
+
+    return float(evaluate_policy_objective_multi(
+        m,
+        demand_IT=demand_IT,
+        distIJ=distIJ,
+        method_name=method_name,
+    ))
+
+
 def evaluate_solution_multi(m, demand_IT):
     """
     Multi-period covered demand explicitly:

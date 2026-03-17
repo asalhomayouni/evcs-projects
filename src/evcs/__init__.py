@@ -12,3 +12,4 @@ from .methods import (
 
 
 from .solve import solve_model
+from .methods import evaluate_u_full_policy_objective_multi
