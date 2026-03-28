@@ -224,7 +224,7 @@ def evaluate_policy_objective_multi(m, demand_IT, distIJ=None, method_name="clos
         ii, jj = int(i), int(j)
         for t in m.T:
             tt = int(t)
-            d = float(demand_IT[tt][ii])
+            d= float(demand_IT[tt, ii])
             cov += d * float(m.y[i, j, t].value or 0.0)
 
     if name == "closest_priority":
@@ -288,22 +288,18 @@ def evaluate_u_full_policy_objective_multi(
 
 
 def evaluate_solution_multi(m, demand_IT):
-    """
-    Multi-period covered demand explicitly:
-      sum_{t,i,j} a[i,t] * y[i,j,t]
-    demand_IT expected as list: demand_IT[t][i]
-    """
+   
     total_demand = 0.0
     total_covered = 0.0
 
     for t in m.T:
         for i in m.I:
-            d = float(demand_IT[int(t)][int(i)])
+            d = float(demand_IT[int(t), int(i)])
             total_demand += d
 
     for (i, j) in m.Arcs:
         for t in m.T:
-            d = float(demand_IT[int(t)][int(i)])
+            d = float(demand_IT[int(t), int(i)])
             total_covered += d * float(m.y[i, j, t].value or 0.0)
 
     cov_pct = 100.0 * total_covered / total_demand if total_demand > 0 else 0.0
@@ -797,19 +793,7 @@ def greedy_schedule_multi_from_variants(
     U=None,                  # max chargers per site (cap), optional
     mode="aggregate_then_fill",  # aggregate_then_fill | per_period
 ):
-    """
-    Build an initial multi-period install schedule u[j,t] using FAST greedy variants.
-
-    Returns:
-      U0: dict {(j,t): int} for j in [0..N-1], t in [0..T-1], with sum_j u[j,t] == P_T[t]
-          (unless limited by U caps; then it will fill as much as possible)
-
-    Notes:
-      - If mode="aggregate_then_fill": build one spatial x_target using sum_t demand, then distribute across periods.
-      - If mode="per_period": run variant greedy independently each period using demand_IT[t] and budget P_T[t].
-      - Enforces per-period budgets P_T.
-      - If U is not None, enforces x[j,t] <= U (cumulative or not).
-    """
+ 
     demand_IT = inst["demand_IT"]
     coords_J = inst["coords_J"]
     T = len(P_T)
@@ -1427,3 +1411,4 @@ def compare_solutions(model_A, model_B, demand_I):
         "x_counts_A": A["x_counts"],
         "x_counts_B": B["x_counts"],
     }
+

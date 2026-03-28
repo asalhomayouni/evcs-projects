@@ -156,3 +156,51 @@ def plot_allowed_arcs(location_df, I_idx, J_idx, in_range, alpha=0.25):
             plt.scatter([xi], [yi], s=120, facecolors="none", edgecolors="gray", alpha=alpha)
         else:
             plt.plot([xi, xj], [yi, yj], color="gray", alpha=alpha, linewidth=1.0)
+
+import matplotlib.pyplot as plt
+
+def plot_dr_curve(history, exact_obj=None, config=None, save_path=None):
+    best_so_far = []
+    current_best = float("-inf")
+
+    for val in history:
+        current_best = max(current_best, val)
+        best_so_far.append(current_best)
+
+    iterations = list(range(len(history)))
+
+    plt.figure(figsize=(8, 5))
+
+    # current (fluctuating)
+    plt.plot(iterations, history, label="DR (current)", alpha=0.6)
+
+    # best-so-far
+    plt.plot(iterations, best_so_far, label="DR (best-so-far)", linewidth=2)
+
+    # exact line
+    if exact_obj is not None:
+        plt.axhline(
+            y=exact_obj,
+            linestyle="--",
+            linewidth=2,
+            label=f"Exact ({exact_obj:.2f})"
+        )
+
+    # title (dynamic)
+    if config:
+        plt.title(
+            f"DR vs Exact | N={config['N']}, T={config['T']}, "
+            f"seed={config['seed']} | policy={config['policy']}"
+        )
+    else:
+        plt.title("DR Convergence Curve")
+
+    plt.xlabel("Iteration")
+    plt.ylabel("Objective Value")
+    plt.grid(True)
+    plt.legend()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300)
+
+    plt.show()

@@ -830,7 +830,7 @@ def reconstruct_multi_u_greedy(
     # Make sure demand_IT is indexed by [t][i]
     # (Assuming you already canonicalized to (T, M))
     def demand_at(t, i):
-        return float(demand_IT[t][i])
+        return float(demand_IT[t, i])
 
     def x_now(j, t):
         """Chargers at site j in period t (cumulative or per-period)."""
@@ -1003,7 +1003,7 @@ def reconstruct_u_dict_fast(
                 for i in neigh:
                     ii = int(i)
                     if uncovered[ii]:
-                        s += float(demand_IT[t][ii])
+                        s += float(demand_IT[t, ii])
 
                 if s <= 1e-12:
                     continue
@@ -1043,10 +1043,10 @@ def reconstruct_u_dict_fast(
                 if uncovered[ii]:
                     reach.append(ii)
 
-            reach.sort(key=lambda ii: float(demand_IT[t][ii]), reverse=True)
+            reach.sort(key=lambda ii: float(demand_IT[t, ii]), reverse=True)
 
             for ii in reach:
-                di = float(demand_IT[t][ii])
+                di = float(demand_IT[t, ii])
                 if used + di <= Q + 1e-9:
                     uncovered[ii] = False
                     used += di
@@ -1099,7 +1099,7 @@ def evaluate_u_numpy_greedy(
         cap_t = cap[t].copy()
 
         for i in range(M):
-            d = float(demand_IT[i, t])
+            d = float(demand_IT[t, i])
             if d <= 1e-12:
                 continue
 
@@ -1231,14 +1231,13 @@ def local_search_u_proxy(
     Q_cap,
     T,
     N,
-    cumulative_install=True,
-    max_chargers_per_site=None,
-    ls_moves=8,
-    ls_frac_remove=0.08,
-    ls_modes=("site_swap", "local_remove"),
-    pre_sorted_J_i=None,
-    Ij_int=None,
-    top_k_choice=3,
+    cumulative_install,
+    max_chargers_per_site,
+    ls_moves,
+    ls_frac_remove,
+    ls_modes,
+    Ij_int=None,              # 🔥 ADD
+    top_k_choice=3            # 🔥 ADD
 ):
     """
     Proxy-guided local search on U-dict only.
@@ -1255,7 +1254,7 @@ def local_search_u_proxy(
         T=int(T),
         N=int(N),
         cumulative_install=cumulative_install,
-        pre_sorted_J_i=pre_sorted_J_i,
+        
     ))
 
     for _ in range(int(ls_moves)):
@@ -1294,7 +1293,7 @@ def local_search_u_proxy(
             T=int(T),
             N=int(N),
             cumulative_install=cumulative_install,
-            pre_sorted_J_i=pre_sorted_J_i,
+           
         ))
 
         if proxy_try > proxy_best + 1e-9:
@@ -1303,7 +1302,6 @@ def local_search_u_proxy(
 
     return U_best, float(proxy_best)
 
-
 def run_DR_multi(
     inst,
     policy: str,
@@ -1311,16 +1309,13 @@ def run_DR_multi(
     Q: float,
     D: float,
     T: int,
-    max_iter: int = 20,                 # now means outer batches
+    max_iter: int = 20,
     dr_time_limit: float = 120.0,
     frac_remove: float = 0.20,
     destroy_mode: str = "local_remove",
-    exact_time_limit: float = 120,
-    exact_mip_gap: float = 0.10,
     max_chargers_per_site: int | None = None,
     cumulative_install: bool = True,
     seed: int | None = None,
-    verbose: bool = False,
     accept_epsilon: float = 0.0,
 
     adaptive_destroy: bool = True,
@@ -1330,86 +1325,46 @@ def run_DR_multi(
     score_best_w: float = 6.0,
     score_improve_w: float = 2.0,
     score_accept_w: float = 0.5,
-   
 
-    # reconstruction diversity
     top_k_choice: int = 3,
 
-    # NEW batch + LS controls
+    # NEW algorithm controls
     batch_size: int = 50,
     top_k_full: int = 5,
     ls_moves: int = 8,
     ls_frac_remove: float = 0.08,
     ls_modes=("site_swap", "local_remove"),
 ):
+
     rng = np.random.default_rng(seed if seed is not None else 0)
 
     coords_I, coords_J = inst["coords_I"], inst["coords_J"]
     M = len(coords_I)
     N = len(coords_J)
 
-    # -------------------------------------------------
-    # Demand canonicalization ONCE -> demand_TM = (T,M)
-    # -------------------------------------------------
-    demand_raw = inst["demand_IT"]
-    demand_arr = np.asarray(demand_raw, dtype=float)
-    if demand_arr.ndim != 2:
-        raise ValueError(f"demand_IT must be 2D. Got shape={getattr(demand_arr,'shape',None)}")
+    # -------------------------
+    # Demand (T,M)
+    # -------------------------
+    demand_TM = np.asarray(inst["demand_IT"], dtype=float)
+    if demand_TM.shape != (T, M):
+        demand_TM = demand_TM.T
 
-    if demand_arr.shape == (T, M):
-        demand_TM = demand_arr
-    elif demand_arr.shape == (M, T):
-        demand_TM = demand_arr.T
-    else:
-        if demand_arr.shape[1] == M:
-            demand_TM = demand_arr
-            T = int(demand_TM.shape[0])
-        elif demand_arr.shape[0] == M:
-            demand_TM = demand_arr.T
-            T = int(demand_TM.shape[0])
-        else:
-            raise ValueError(f"demand_IT shape {demand_arr.shape} incompatible with M={M} and T={T}")
-
-    # Align P_T to final T
-    P_T = list(P_T)
-    if len(P_T) > T:
-        P_T = P_T[:T]
-    elif len(P_T) < T:
-        P_T = P_T + [P_T[-1]] * (T - len(P_T))
-
-    # -------------------------------------------------
-    # Arcs + adjacency for reconstruction
-    # -------------------------------------------------
-    distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D, forbid_self=False)
+    # -------------------------
+    # Arcs
+    # -------------------------
+    distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D)
 
     Ij_int = {j: [] for j in range(N)}
     Ji_int = {i: [] for i in range(M)}
     for (i, j) in in_range:
-        i = int(i)
-        j = int(j)
-        if 0 <= i < M and 0 <= j < N:
-            Ij_int[j].append(i)
-            Ji_int[i].append(j)
+        Ij_int[j].append(i)
+        Ji_int[i].append(j)
 
-    # -------------------------------------------------
-    # Pre-sort feasible sites for each demand node
-    # -------------------------------------------------
-    is_dict = isinstance(distIJ, dict)
-    J_i_list = []
-    for i in range(M):
-        js = Ji_int.get(i, [])
-        if not js:
-            J_i_list.append([])
-        else:
-            if is_dict:
-                J_i_list.append(sorted(js, key=lambda j: distIJ[(i, j)]))
-            else:
-                J_i_list.append(sorted(js, key=lambda j: distIJ[i, j]))
-    pre_sorted_J_i = J_i_list
+    J_i_list = [sorted(Ji_int[i], key=lambda j: distIJ[(i, j)]) for i in range(M)]
 
-    # -------------------------------------------------
-    # Template model (NO extra apply_method_multi here)
-    # -------------------------------------------------
+    # -------------------------
+    # Model template
+    # -------------------------
     m_template = build_multi_period_model(
         M=M, N=N, T=T,
         in_range=in_range, Ji=Ji, Ij=Ij,
@@ -1421,540 +1376,146 @@ def run_DR_multi(
         cumulative_install=cumulative_install,
     )
 
-    U_cap = int(m_template.U.value) if hasattr(m_template, "U") else int(max(P_T))
     Q_cap = float(m_template.Q.value)
 
-    # -------------------------------------------------
-    # Initial greedy solution
-    # -------------------------------------------------
-    U0 = greedy_schedule_multi_from_variants(
-        inst=inst,
-        P_T=P_T,
-        D_cover=D,
-        variant="ring",
-        seed=(seed or 0),
-        cumulative_install=cumulative_install,
-        U=max_chargers_per_site,
-        mode="aggregate_then_fill",
+    # -------------------------
+    # Initial solution
+    # -------------------------
+    U_curr = greedy_schedule_multi_from_variants(
+        inst, P_T, D, seed=seed
     )
 
-    m0 = m_template.clone()
-    for (j, t), val in U0.items():
-        try:
-            m0.u[j, t].value = int(val)
-        except Exception:
-            pass
-
-    sync_solution_state(m0, cumulative_install=cumulative_install)
-
-    m0 = reassign_y_greedy_multi(
-        m0,
-        distIJ,
-        Ji,
-        method_name=policy,
-        cumulative_install=cumulative_install,
+    proxy_curr = evaluate_u_numpy_greedy_binary(
+        U_curr, demand_TM, J_i_list, distIJ,
+        Q_cap, T, N, cumulative_install
     )
 
-    U_curr = _clone_u_matrix(m0)
-
-    proxy_curr = float(evaluate_u_numpy_greedy_binary(
-        U_curr,
-        demand_TM=demand_TM,
-        J_i_list=J_i_list,
-        distIJ=distIJ,
-        Q_cap=float(Q_cap),
-        T=int(T),
-        N=int(N),
-        cumulative_install=cumulative_install,
-        pre_sorted_J_i=pre_sorted_J_i,
-    ))
-    proxy_best = float(proxy_curr)
-
-    ret0 = full_eval_from_U(
-        U_curr,
-        m_template,
-        inst,
-        distIJ,
-        policy,
-        demand_TM=demand_TM,
-        cumulative_install=cumulative_install,
+    full0 = full_eval_from_U(
+        U_curr, m_template, inst, distIJ, policy,
+        demand_TM=demand_TM, cumulative_install=cumulative_install
     )
 
-    score0 = float(ret0[0])
-    _m0_full = ret0[1]
-
-    score_curr = float(score0)
-    best_full_score = float(score0)
-    U_best_full = dict(U_curr)
-    m_best_full = _m0_full
-
-    # -------------------------------------------------
-    # Logs
-    # -------------------------------------------------
-    logger = DRLogger()
-    dr_trace = []
-    batch_logs = []
-
-    logger.log(0, float(proxy_curr), float(best_full_score), 0.0, 0, "init", 1, 1)
-    dr_trace.append({
-        "iteration": 0,
-        "time": 0.0,
-        "mode": "init",
-        "k_remove": 0,
-        "current": float(proxy_curr),
-        "after_destroy": np.nan,
-        "score_try": np.nan,
-        "proxy_try": np.nan,
-        "proxy_curr": float(proxy_curr),
-        "proxy_best": float(proxy_best),
-        "did_full_eval": True,
-        "score_try_full": float(score0),
-        "best_full": float(best_full_score),
-        "accepted": True,
-        "improved_curr": True,
-        "proxy_improved_best": True,
-        "improved_best_full": True,
-        "batch_size": 1,
-        "top_k_full": 1,
-    })
+    best_full_score = float(full0[0])
+    U_best = dict(U_curr)
 
     seen = set()
-
-    def hash_u(Ud):
-        return tuple(Ud[k] for k in sorted(Ud.keys()))
+    def hash_u(U):
+        return tuple(sorted(U.items()))
 
     seen.add(hash_u(U_curr))
 
     t_start = time.perf_counter()
 
-    # Profiling
-    t_destroy = 0.0
-    t_reconstruct = 0.0
-    t_eval = 0.0
-    t_log = 0.0
-    t_other = 0.0
-    n_destroy_calls = 0
-    n_reconstruct_calls = 0
-    n_eval_calls = 1  # initial full eval already done
+    # =========================
+    # MAIN LOOP (LEFT FLOWCHART)
+    # =========================
+    for it in range(max_iter):
 
-    # Adaptive destroy init
-    if adaptive_destroy:
-        modes = list(destroy_modes)
-        K = len(modes)
-        w = np.ones(K, dtype=float)
-        p = w / w.sum()
-
-        window_picked = {m: 0 for m in modes}
-        window_accepted = {m: 0 for m in modes}
-        window_best_delta = {m: 0.0 for m in modes}
-        window_reward_sum = {m: 0.0 for m in modes}
-        batch_start_best = float(best_full_score)
-
-        best_impr_sum = {m: 0.0 for m in modes}
-        best_impr_cnt = {m: 0 for m in modes}
-    else:
-        modes = [str(destroy_mode)]
-        w = None
-        p = None
-        window_picked = {modes[0]: 0}
-        window_accepted = {modes[0]: 0}
-        window_best_delta = {modes[0]: 0.0}
-        window_reward_sum = {modes[0]: 0.0}
-        batch_start_best = float(best_full_score)
-        best_impr_sum = {modes[0]: 0.0}
-        best_impr_cnt = {modes[0]: 0}
-
-    op_used = {m: 0 for m in modes}
-    op_accepted = {m: 0 for m in modes}
-    op_best = {m: 0 for m in modes}
-
-    # -------------------------------------------------
-    # NEW BATCH-BASED DR LOOP
-    # -------------------------------------------------
-    batch_id = 0
-    frac_remove = float(frac_remove)
-    accept_epsilon_base = float(accept_epsilon)
-    no_improve_batches = 0
-
-    while batch_id < int(max_iter) and (time.perf_counter() - t_start) < float(dr_time_limit):
-        batch_id += 1
-        batch_loop_start = time.perf_counter()
+        if time.perf_counter() - t_start > dr_time_limit:
+            break
 
         candidate_pool = []
 
-        # --------------------------------------
-        # 1) Generate batch_size candidate solutions
-        # --------------------------------------
-        for _ in range(int(batch_size)):
-            if (time.perf_counter() - t_start) >= float(dr_time_limit):
-                break
+        # -------------------------
+        # 1) Generate candidates
+        # -------------------------
+        for _ in range(batch_size):
 
-            if adaptive_destroy:
-                mode = str(rng.choice(modes, p=p))
-            else:
-                mode = str(destroy_mode)
+            base = U_curr if rng.random() < 0.7 else U_best
 
-            op_used[mode] += 1
-            window_picked[mode] += 1
-
-            # destroy
-            _t0 = time.perf_counter()
-            U_partial, k_removed = destroy_multi_u(
-                U_curr,
-                inst=inst,
-                rng=rng,
-                P_T=P_T,
-                frac_remove=float(frac_remove),
-                mode=mode,
-                seed=None,
-                site_cap=max_chargers_per_site,
-                cumulative_install=cumulative_install,
+            U_partial, _ = destroy_multi_u(
+                base, inst, rng, P_T, frac_remove, destroy_mode
             )
-            t_destroy += (time.perf_counter() - _t0)
-            n_destroy_calls += 1
 
-            # reconstruct
-            _t1 = time.perf_counter()
             U_recon, _ = reconstruct_u_dict_fast(
-                U_partial=dict(U_partial),
-                demand_IT=demand_TM,
-                P_T=P_T,
-                Ij_int=Ij_int,
-                U_cap=U_cap,
-                Q=float(Q_cap),
-                rng=rng,
-                cumulative_install=cumulative_install,
-                top_k_choice=int(top_k_choice),
+                U_partial, demand_TM, P_T, Ij_int,
+                U_cap = int(max(P_T) * T), Q=Q_cap, rng=rng
             )
-            t_reconstruct += (time.perf_counter() - _t1)
-            n_reconstruct_calls += 1
 
-            # separate local search layer
-            _t2 = time.perf_counter()
-            U_ls, proxy_ls = local_search_u_proxy(
-                U_start=U_recon,
-                inst=inst,
-                rng=rng,
-                P_T=P_T,
-                demand_TM=demand_TM,
-                J_i_list=J_i_list,
-                distIJ=distIJ,
-                Q_cap=Q_cap,
-                T=T,
-                N=N,
-                cumulative_install=cumulative_install,
-                max_chargers_per_site=max_chargers_per_site,
-                ls_moves=ls_moves,
-                ls_frac_remove=ls_frac_remove,
-                ls_modes=ls_modes,
-                pre_sorted_J_i=pre_sorted_J_i,
-                Ij_int=Ij_int,
-                top_k_choice=top_k_choice,
+            h = hash_u(U_recon)
+            if h in seen:
+                continue
+            seen.add(h)
+
+            proxy = evaluate_u_numpy_greedy_binary(
+                U_recon, demand_TM, J_i_list, distIJ,
+                Q_cap, T, N, cumulative_install
             )
-            t_reconstruct += (time.perf_counter() - _t2)
 
-            candidate_pool.append({
-                "mode": mode,
-                "k_removed": int(k_removed),
-                "U": dict(U_ls),
-                "proxy": float(proxy_ls),
-            })
+            candidate_pool.append((proxy, U_recon))
 
         if not candidate_pool:
-            break
+            continue
 
-        # --------------------------------------
-        # 2) Rank all candidates by proxy
-        # --------------------------------------
-        candidate_pool.sort(key=lambda r: r["proxy"], reverse=True)
+        # -------------------------
+        # 2) Rank by proxy
+        # -------------------------
+        candidate_pool.sort(reverse=True, key=lambda x: x[0])
 
-        batch_best_proxy = float(candidate_pool[0]["proxy"])
-        batch_best_mode = str(candidate_pool[0]["mode"])
-        batch_best_k_removed = int(candidate_pool[0]["k_removed"])
+        # -------------------------
+        # 3) Top-k selection
+        # -------------------------
+        k = min(top_k_full, len(candidate_pool))
+        top_candidates = candidate_pool[:k]
 
-        if batch_best_proxy > proxy_best + 1e-9:
-            proxy_best = float(batch_best_proxy)
+        # -------------------------
+        # 4) Local Search (ONLY top-k)
+        # -------------------------
+        improved_candidates = []
 
-        # --------------------------------------
-        # 3) Full evaluate top-k candidates
-        # --------------------------------------
-        k_eval = min(int(top_k_full), len(candidate_pool))
-        top_candidates = candidate_pool[:k_eval]
+        for proxy, U in top_candidates:
+            U_ls, proxy_ls = local_search_u_proxy(
+                U, inst, rng, P_T,
+                demand_TM, J_i_list, distIJ,
+                Q_cap, T, N,
+                cumulative_install,
+                max_chargers_per_site,
+                ls_moves, ls_frac_remove, ls_modes,
+                Ij_int=Ij_int,          # 🔥 ADD THIS
+                top_k_choice=top_k_choice
+            )
+            improved_candidates.append((proxy_ls, U_ls))
 
-        best_batch_full_score = -1e18
+        # -------------------------
+        # 5) Full evaluation
+        # -------------------------
+        best_batch_score = -1e18
         best_batch_U = None
-        best_batch_mode = None
-        best_batch_proxy = None
-        best_batch_model = None
 
-        for rec in top_candidates:
-            _te = time.perf_counter()
-            ret_full = full_eval_from_U(
-                rec["U"],
-                m_template,
-                inst,
-                distIJ,
-                policy,
+        for proxy, U in improved_candidates:
+            score, _, _ = full_eval_from_U(
+                U, m_template, inst, distIJ, policy,
                 demand_TM=demand_TM,
-                cumulative_install=cumulative_install,
+                cumulative_install=cumulative_install
             )
-            full_score_try = float(ret_full[0])
-            m_tmp = ret_full[1]
 
-            t_eval += (time.perf_counter() - _te)
-            n_eval_calls += 1
+            if score > best_batch_score:
+                best_batch_score = score
+                best_batch_U = U
 
-            if full_score_try > best_batch_full_score + 1e-9:
-                best_batch_full_score = float(full_score_try)
-                best_batch_U = dict(rec["U"])
-                best_batch_mode = str(rec["mode"])
-                best_batch_proxy = float(rec["proxy"])
-                best_batch_model = m_tmp
-
-        # --------------------------------------
-        # 4) Compare best fully evaluated candidate to incumbent
-        # --------------------------------------
-        accepted = False
-        improved_curr = False
-        improved_best_full = False
-        delta_best_full = 0.0
-        reward = 0.0
-
+        # -------------------------
+        # 6) Accept / Update
+        # -------------------------
         if best_batch_U is not None:
-            old_score_curr = float(score_curr)
 
-            if best_batch_full_score >= old_score_curr - float(accept_epsilon):
+            if best_batch_score >= best_full_score - accept_epsilon:
                 U_curr = dict(best_batch_U)
-                score_curr = float(best_batch_full_score)
-                proxy_curr = float(best_batch_proxy)
-                accepted = True
+                proxy_curr = proxy
 
-                # only true if current full score really improved
-                if best_batch_full_score > old_score_curr + 1e-9:
-                    improved_curr = True
+            if best_batch_score > best_full_score:
+                best_full_score = best_batch_score
+                U_best = dict(best_batch_U)
 
-                op_accepted[best_batch_mode] += 1
-                window_accepted[best_batch_mode] += 1
-
-            if best_batch_full_score > best_full_score + 1e-9:
-                improved_best_full = True
-                delta_best_full = float(best_batch_full_score - best_full_score)
-                best_full_score = float(best_batch_full_score)
-                U_best_full = dict(best_batch_U)
-                m_best_full = best_batch_model
-
-                op_best[best_batch_mode] += 1
-                best_impr_sum[best_batch_mode] += delta_best_full
-                best_impr_cnt[best_batch_mode] += 1
-                window_best_delta[best_batch_mode] += delta_best_full
-
-            if improved_best_full:
-                reward = float(score_best_w)
-            elif improved_curr:
-                reward = float(score_improve_w)
-            elif accepted:
-                reward = float(score_accept_w)
-            else:
-                reward = 0.0
-
-            if best_batch_mode is not None:
-                window_reward_sum[best_batch_mode] += float(reward)
-
-        # --------------------------------------
-        # 5) Logging
-        # --------------------------------------
-        elapsed = float(time.perf_counter() - t_start)
-
-        dr_trace.append({
-            "iteration": int(batch_id),
-            "time": float(elapsed),
-            "mode": str(best_batch_mode) if best_batch_mode is not None else "batch",
-            "k_remove": float(batch_best_k_removed) if batch_best_k_removed is not None else np.nan,
-            "current": float(proxy_curr),
-            "after_destroy": np.nan,
-            "score_try": float(batch_best_proxy),
-            "proxy_try": float(batch_best_proxy),
-            "proxy_curr": float(proxy_curr),
-            "proxy_best": float(proxy_best),
-            "did_full_eval": True,
-            "score_try_full": float(best_batch_full_score) if best_batch_U is not None else np.nan,
-            "best_full": float(best_full_score),
-            "accepted": bool(accepted),
-            "improved_curr": bool(improved_curr),
-            "proxy_improved_best": bool(batch_best_proxy >= proxy_best - 1e-9),
-            "improved_best_full": bool(improved_best_full),
-            "batch_size": int(len(candidate_pool)),
-            "top_k_full": int(k_eval),
-        })
-
-        _tlog0 = time.perf_counter()
-        seen.add(hash_u(U_curr))
-        logger.log(
-            int(batch_id),
-            float(proxy_curr),
-            float(best_full_score),
-            float(elapsed),
-            int(batch_best_k_removed) if batch_best_k_removed is not None else 0,
-            str(best_batch_mode) if best_batch_mode is not None else "batch",
-            int(accepted),
-            int(len(seen)),
-        )
-        t_log += (time.perf_counter() - _tlog0)
-
-        # --------------------------------------
-        # 6) Adaptive destroy update by batch
-        # --------------------------------------
-        if adaptive_destroy and (batch_id % int(update_every) == 0):
-            batch_end_best = float(best_full_score)
-            batch_impr = batch_end_best - float(batch_start_best)
-
-            no_improve_batches = (no_improve_batches + 1) if (batch_impr <= 1e-12) else 0
-
-            # mild diversification if stagnating
-            if no_improve_batches >= 2:
-                frac_remove = min(0.80, float(frac_remove) + 0.10)
-                accept_epsilon = min(0.20, float(accept_epsilon) + 0.02)
-            else:
-                frac_remove = max(0.05, float(frac_remove) - 0.02)
-                accept_epsilon = max(accept_epsilon_base, float(accept_epsilon) - 0.01)
-
-            row = {
-                "iter_from": int(batch_id - update_every + 1),
-                "iter_to": int(batch_id),
-                "best_start": float(batch_start_best),
-                "best_end": float(batch_end_best),
-                "batch_best_improvement": float(batch_impr),
-            }
-
-            for m in modes:
-                picked = int(window_picked[m])
-                acc = int(window_accepted[m])
-                row[f"{m}_picked"] = picked
-                row[f"{m}_accepted"] = acc
-                row[f"{m}_acc_rate"] = (acc / picked) if picked > 0 else 0.0
-                row[f"{m}_best_delta"] = float(window_best_delta[m])
-                row[f"{m}_avg_reward"] = (float(window_reward_sum[m]) / picked) if picked > 0 else 0.0
-
-            batch_logs.append(row)
-
-            for k_idx, m in enumerate(modes):
-                picked = int(window_picked[m])
-                avg_reward = (float(window_reward_sum[m]) / picked) if picked > 0 else 0.0
-                w[k_idx] = (1.0 - float(reaction)) * float(w[k_idx]) + float(reaction) * float(avg_reward)
-
-            w = np.maximum(w, 1e-9)
-            p = w / w.sum()
-
-            batch_start_best = float(best_full_score)
-            for m in modes:
-                window_picked[m] = 0
-                window_accepted[m] = 0
-                window_best_delta[m] = 0.0
-                window_reward_sum[m] = 0.0
-
-        t_other += max(0.0, time.perf_counter() - batch_loop_start)
-
-    # -------------------------------------------------
-    # End loop: profiling
-    # -------------------------------------------------
-    total_elapsed = float(time.perf_counter() - t_start)
-    t_other = max(0.0, total_elapsed - (t_destroy + t_reconstruct + t_eval + t_log))
-
-    profiling = dict(
-        total_elapsed=float(total_elapsed),
-        t_destroy=float(t_destroy),
-        t_reconstruct=float(t_reconstruct),
-        t_eval=float(t_eval),
-        t_log=float(t_log),
-        t_other=float(t_other),
-        n_destroy_calls=int(n_destroy_calls),
-        n_reconstruct_calls=int(n_reconstruct_calls),
-        n_eval_calls=int(n_eval_calls),
-    )
-
-    # contribution summary
-    contrib_rows = []
-    for m in modes:
-        contrib_rows.append({
-            "mode": m,
-            "best_impr_sum": float(best_impr_sum.get(m, 0.0)),
-            "best_impr_cnt": int(best_impr_cnt.get(m, 0)),
-            "avg_best_impr": float(best_impr_sum.get(m, 0.0)) / max(1, int(best_impr_cnt.get(m, 0))),
-            "used": int(op_used.get(m, 0)),
-            "accepted": int(op_accepted.get(m, 0)),
-            "best_hits": int(op_best.get(m, 0)),
-        })
-
-    df_contrib = pd.DataFrame(contrib_rows).sort_values("best_impr_sum", ascending=False)
-    
-    dr_best_raw_obj = np.nan
-    try:
-        if m_best_full is not None:
-            dr_best_raw_obj = float(
-                evaluate_policy_objective_multi(
-                    m_best_full,
-                    demand_TM,
-                    distIJ=distIJ,
-                    method_name=policy,
-                )
-            )
-    except Exception:
-        dr_best_raw_obj = np.nan
-
-
-    inst_tag = str(inst.get("meta", {}).get("tag", ""))
-
-    return dict(
-        inst_tag=inst_tag,
-        policy=policy,
-
-        # DR best (full evaluated aligned score)
-        m_best=m_best_full,
-        U_best=dict(U_best_full),
-        DR_best_total_eval=float(best_full_score),
-        DR_best_raw_obj=float(dr_best_raw_obj) if np.isfinite(dr_best_raw_obj) else np.nan,
-        DR_best_proxy=float(proxy_best),
-
-        # exact is handled outside DR
-        m_exact=None,
-        exact_score=None,
-        exact_raw_obj=None,
-        exact_has_feasible=None,
-        time_exact=None,
-        exact_termination=None,
-        exact_gap=None,
-        proven_optimal=None,
-
-        # logs
-        DR_log=logger.to_df(),
-        DR_trace=pd.DataFrame(dr_trace),
-        DR_batches=pd.DataFrame(batch_logs),
-        DR_contrib=df_contrib,
-
-        # misc
-        distIJ=distIJ,
-        destroy_modes=list(modes),
-        profiling=profiling,
-        DR_total_full_evals=int(n_eval_calls),
-        DR_time=float(total_elapsed),
-
-        # helpful metadata for the new scheme
-        batch_size=int(batch_size),
-        top_k_full=int(top_k_full),
-        ls_moves=int(ls_moves),
-    )
+    return {
+        "U_best": U_best,
+        "best_obj": best_full_score,
+        "time": time.perf_counter() - t_start,
+    }
 
 
 
 def covered_by_period(m, inst, y_thr=0.5):
-    """
-    Returns covered demand per period based on y[i,j,t] assignments.
-    Safe when some y vars are uninitialized (skips None values).
-
-    demand_IT can be either:
-      - (T, M): demand_IT[t][i]
-      - (M, T): demand_IT[i][t]
-    """
+  
 
     demand_raw = inst["demand_IT"]
     demand = np.asarray(demand_raw, dtype=float)

@@ -1,37 +1,65 @@
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from scipy.spatial.distance import cdist
 
-def load_instance(loc_path, dem_path, demand_site_type=None, facility_site_type=None):
+
+def load_instance(csv_path, radius=0.02, T=8):
     """
-    Reads files and returns coords & index sets for demand nodes (I) and sites (J).
-    location file columns: x, y, type
-    demand file: one number per row (same order as location rows)
+    Load EVCS instance from CSV (like Bergamo dataset)
+
+    Returns:
+        inst dict with EVERYTHING needed for model + DR
     """
-    loc_path, dem_path = Path(loc_path), Path(dem_path)
-    loc = pd.read_csv(loc_path, sep="\t", header=None, names=["x","y","type"])
-    dem = pd.read_csv(dem_path, sep="\t", header=None).iloc[:,0].to_numpy(float)
 
-    if demand_site_type is None:
-        I_idx = list(range(len(loc)))
-    else:
-        I_idx = loc.index[loc["type"] == demand_site_type].tolist()
+    csv_path = Path(csv_path)
 
-    if facility_site_type is None:
-        J_idx = list(range(len(loc)))
-    else:
-        J_idx = loc.index[loc["type"] == facility_site_type].tolist()
+    # =========================
+    # 1) READ CSV
+    # =========================
+    df = pd.read_csv(csv_path)
 
-    coords = loc[["x","y"]].to_numpy()
+    coords = df[["Centroid_Longitude", "Centroid_Latitude"]].values
+    demand_vec = df["Aggregated_Population"].values
 
-    return dict(
-        location_df=loc,
-        coords=coords,
-        demand_full=dem,
-        I_idx=I_idx,
-        J_idx=J_idx,
-        coords_I=coords[I_idx,:],
-        coords_J=coords[J_idx,:],
-        demand_I=dem[I_idx],
-    )
+    N = len(coords)
+    M = N  # assume demand nodes == candidate sites
 
+    # =========================
+    # 2) DISTANCES
+    # =========================
+    distIJ = cdist(coords, coords)
+
+    # =========================
+    # 3) COVERAGE (ARCS)
+    # =========================
+    in_range_matrix = (distIJ <= radius)
+
+    Arcs = [(i, j) for i in range(N) for j in range(N) if in_range_matrix[i, j]]
+
+    # adjacency lists
+    Ji = {i: list(np.where(in_range_matrix[i])[0]) for i in range(N)}
+    Ij = {j: list(np.where(in_range_matrix[:, j])[0]) for j in range(N)}
+
+    # =========================
+    # 4) DEMAND (MULTI-PERIOD)
+    # =========================
+    demand_IT = np.tile(demand_vec, (T, 1))  # shape (T, N)
+
+    # =========================
+    # 5) PACK INSTANCE
+    # =========================
+    inst = {
+        "M": M,
+        "N": N,
+        "coords_I": coords,
+        "coords_J": coords,
+        "demand_I": demand_vec,
+        "demand_IT": demand_IT,
+        "distIJ": distIJ,
+        "in_range": Arcs,   # IMPORTANT: arcs list for Pyomo
+        "Ji": Ji,
+        "Ij": Ij,
+    }
+
+    return inst

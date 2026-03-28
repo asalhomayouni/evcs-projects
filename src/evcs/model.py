@@ -28,9 +28,11 @@ def _build_single_period_demand_init(M, demand_I):
 
 
 def _build_multi_period_demand_init(M, T, demand_IT):
-    if isinstance(demand_IT, dict):
-        return {(i, t): float(demand_IT[(i, t)]) for t in range(T) for i in range(M)}
-    return {(i, t): float(demand_IT[t][i]) for t in range(T) for i in range(M)}
+    return {
+        (i, t): float(demand_IT[t, i]) if demand_IT[t, i] is not None else 0.0
+        for i in range(M)
+        for t in range(T)
+    }
 
 
 

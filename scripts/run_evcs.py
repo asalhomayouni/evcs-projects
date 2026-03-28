@@ -1,191 +1,378 @@
-import time
+# =========================
+# 0) IMPORTS & PATHS
+# =========================
 from pathlib import Path
+import time
 import pandas as pd
 import sys
+import numpy as np
 
-# =========================
-# PATHS
-# =========================
-PROJECT_ROOT = Path.home() / "scratch" / "evcs-projects"
-SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
-
-sys.path.append(str(SCRIPTS_DIR))
 sys.path.append(str(SRC_DIR))
 
+from evcs import (
+    load_instance,
+    build_multi_period_model,
+    solve_model,
+    run_DR_multi
+)
+
+from evcs.methods import sync_solution_state, reassign_y_greedy_multi
+import matplotlib.pyplot as plt
+
+
+# =========================
+# CONFIG
+# =========================
+DATA_DIR = PROJECT_ROOT / "data" / "input"
 RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# =========================
-# IMPORTS
-# =========================
-import Instance
-import destruction_reconstruction as dr
+CSV_NAME = "center_240_Parma_k200.csv"
 
-from evcs.model import build_multi_period_model
-from evcs.solve import solve_model
-
-# =========================
-# CHOOSE YOUR INSTANCE
-# =========================
-CSV_NAME = "input/center_40_Bergamo_k125.csv"
-
-csv_path = PROJECT_ROOT / "data" / CSV_NAME
-
-print(f"Loading instance: {csv_path}")
-
-# =========================
-# BUILD INSTANCE FROM CSV
-# =========================
-import numpy as np
-
-df = pd.read_csv(csv_path)
-
-coords = df[["Centroid_Longitude", "Centroid_Latitude"]].values
-coords_I = coords.copy()
-coords_J = coords.copy()
-demand_vec = df["Aggregated_Population"].values
-
-N = len(coords)
-M = N   # assume all locations can host chargers (like your notebook)
-
-print(f"N = {N}")
-
-# Distance matrix
-from scipy.spatial.distance import cdist
-distIJ = cdist(coords, coords)
-
-# Coverage radius (you can tune this later)
-radius = 0.02  # 🔥 IMPORTANT (controls connectivity)
-
-# Build in_range matrix
-in_range = (distIJ <= radius).astype(int)
-
-# 🔥 Convert to arc list for Pyomo
-Arcs = [(i, j) for i in range(N) for j in range(N) if in_range[i, j] == 1]
-# Build adjacency lists
-Ji = {i: list(np.where(in_range[i] == 1)[0]) for i in range(N)}
-Ij = {j: list(np.where(in_range[:, j] == 1)[0]) for j in range(N)}
-
-# Multi-period demand
-T = 8
-
-demand_IT = np.tile(demand_vec, (T, 1))   # (T, N)
-# Single-period proxy for DR
-demand_I = demand_vec.copy()
-
-# Pack into inst dict
-inst = {
-    "M": M,
-    "N": N,
-    "in_range": in_range,
-    "Ji": Ji,
-    "Ij": Ij,
-    "demand_IT": demand_IT,
-    "demand_I": demand_I,
-    "distIJ": distIJ,
-    "coords_I": coords_I,
-    "coords_J": coords_J
-}
-# =========================
-# PARAMETERS
-# =========================
-T = 8
-P_T = [2, 2, 1, 2, 2, 1, 1, 1]
-
+T = 6
+P_T = [2,2,1,2,1,2]
 policy = "closest_priority"
-Q = 12
+Q = 20
 max_chargers_per_site = 5
 
 # DR
-max_iter = 200
+max_iter = 100
 dr_time_limit = 300
+seed = 11
+
+frac_remove = 0.3
+accept_epsilon = 0.01
+adaptive_destroy = True
+destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
-exact_time_limit = 1200
+exact_time_limit = 5000
+mip_gap = 1e-4
+
 
 # =========================
-# EXTRACT INSTANCE
+# MAIN
 # =========================
-M = inst["M"]
-N = inst["N"]
-in_range = inst["in_range"]
-Ji = inst["Ji"]
-Ij = inst["Ij"]
-demand = inst["demand_IT"]
-dist = inst["distIJ"]
+def run_single_experiment():
 
+    print("Starting EVCS experiment")
+    t_global_start = time.time()
+
+    # -------------------------
+    # LOAD
+    # -------------------------
+    inst = load_instance(DATA_DIR / CSV_NAME)
+
+    M, N = inst["M"], inst["N"]
+    Ji, Ij = inst["Ji"], inst["Ij"]
+    distIJ = inst["distIJ"]
+    in_range = inst["in_range"]
+    demand_IT = inst["demand_IT"]
+
+   
+    # Demand handling (ROBUST)
+    # -------------------------
+    demand_IT = np.asarray(inst["demand_IT"], dtype=float)
+
+    # Fix orientation
+    if demand_IT.shape[0] == M:
+        demand_IT = demand_IT.T
+
+    # T from data
+    T_data = demand_IT.shape[0]
+    T = T_data
+
+    # ✅ MAKE LOCAL COPY (IMPORTANT)
+    P_T_local = list(P_T)
+
+    # Align P_T safely
+    if len(P_T_local) > T:
+        P_T_local = P_T_local[:T]
+    elif len(P_T_local) < T:
+        P_T_local = P_T_local + [P_T_local[-1]] * (T - len(P_T_local))
+
+    inst["demand_IT"] = demand_IT
+
+    print("FINAL SHAPE:", demand_IT.shape)
+    print("Using T =", T)
+    # -------------------------
+    # DR
+    # -------------------------
+    print(" Running DR...")
+    t_dr_start = time.time()
+
+    dr_out = run_DR_multi(
+        inst=inst,
+        policy=policy,
+        P_T=P_T_local, 
+        Q=Q,
+        D=3,
+        T=T,
+        max_iter=max_iter,
+        dr_time_limit=dr_time_limit,
+        seed=seed,
+        max_chargers_per_site=max_chargers_per_site,
+        frac_remove=frac_remove,
+        accept_epsilon=accept_epsilon,
+        adaptive_destroy=adaptive_destroy,
+        destroy_modes=destroy_modes,
+    )
+
+    t_dr_end = time.time()
+
+    dr_best = dr_out["best_obj"]
+    print(f"DR best = {dr_best:.2f}")
+
+    # -------------------------
+    # EXACT
+    # -------------------------
+    print(" Running Exact...")
+    t_exact_start = time.time()
+
+    model = build_multi_period_model(
+        M=M, N=N, T=T,
+        in_range=in_range,
+        Ji=Ji,
+        Ij=Ij,
+        demand_IT=demand_IT,
+        Q=Q,
+        P_T=P_T_local,
+        distIJ=distIJ,
+        method_name=policy,
+        max_chargers_per_site=max_chargers_per_site
+    )
+
+    solve_model(
+        model,
+        time_limit=exact_time_limit,
+        mip_gap=mip_gap,
+        solver_name="gurobi"
+    )
+
+    t_exact_end = time.time()
+
+    res = solve_model(
+        model,
+        time_limit=exact_time_limit,
+        mip_gap=mip_gap,
+        solver_name="gurobi"
+    )
+
+    exact_inc_raw = getattr(res, "best_feasible_objective", None)
+    exact_bound_raw = getattr(res, "best_objective_bound", None)
+
+    if exact_inc_raw is not None:
+        exact_inc_raw = float(exact_inc_raw)
+
+    if exact_bound_raw is not None:
+        exact_bound_raw = float(exact_bound_raw)
+
+    # compute raw gap
+    if exact_inc_raw is not None and exact_bound_raw is not None:
+        exact_gap_raw = abs(exact_inc_raw - exact_bound_raw) / max(abs(exact_inc_raw), 1e-9)
+    else:
+        exact_gap_raw = None
+
+    # -------------------------
+    # Extract U
+    # -------------------------
+    U_exact = {
+        (j, t): int(round(model.u[j, t].value))
+        for j in model.J
+        for t in model.T
+    }
+
+    # -------------------------
+    # Evaluate EXACT (same as DR)
+    # -------------------------
+    m_tmp = model.clone()
+
+    for (j, t), val in U_exact.items():
+        m_tmp.u[j, t].value = val
+
+    sync_solution_state(m_tmp, cumulative_install=True)
+
+    reassign_y_greedy_multi(
+        m_tmp,
+        distIJ,
+        Ji=inst["Ji"],
+        method_name=policy,
+        cumulative_install=True
+    )
+
+    exact_obj = 0.0
+    for t in m_tmp.T:
+        for i in m_tmp.I:
+            for j in inst["Ji"][i]:
+                val = m_tmp.y[i, j, t].value
+                if val is not None and val > 0.5:
+                    exact_obj += demand_IT[t, i]
+                    break
+
+    print(f"Exact obj = {exact_obj:.2f}")
+
+    # -------------------------
+    # GAP
+    # -------------------------
+    gap = (exact_obj - dr_best) / exact_obj if exact_obj > 0 else None
+
+    # -------------------------
+    # SAVE + REPORT (CLEAN)
+
+    t_global_end = time.time()
+
+    # ---- Summary numbers ----
+    gap = exact_obj - dr_best
+    gap_pct = 100 * gap / max(exact_obj, 1e-9)
+    total_demand = float(demand_IT.sum())
+
+    # =========================
+    # TERMINAL OUTPUT
+    # =========================
+    print("\n===== RESULTS =====")
+    print(f"Instance : {CSV_NAME}")
+    print(f"N, M, T  : {N}, {M}, {T}")
+    print(f"Policy   : {policy}")
+    print(f"DR best  : {dr_best:.4f}")
+    print(f"Exact    : {exact_obj:.4f}")
+    print(f"Gap      : {gap:.4f} ({gap_pct:.2f}%)")
+    print(f"Time DR  : {t_dr_end - t_dr_start:.2f}s")
+    print(f"Time EX  : {t_exact_end - t_exact_start:.2f}s")
+    print("=====================\n")
+
+    # =========================
+    # EXCEL LOG (RESEARCH LEVEL)
+    # =========================
+    excel_file = RESULTS_DIR / "benchmark_new_algorithm.xlsx"
+
+    total_demand = float(demand_IT.sum())
+
+    # -------------------------
+    # ALIGNED OBJECTIVES
+    # -------------------------
+    exact_aligned = exact_obj
+    dr_aligned = dr_best
+
+    gap_aligned = exact_aligned - dr_aligned
+    gap_aligned_pct = 100 * gap_aligned / max(exact_aligned, 1e-9)
+
+    # -------------------------
+    # RAW OBJECTIVES (MIP)
+    # -------------------------
+    gap_raw_inc = None
+    gap_raw_inc_pct = None
+
+    if exact_inc_raw is not None:
+        # DR has no true raw → compare to aligned proxy (optional)
+        dr_raw_proxy = dr_aligned
+
+        gap_raw_inc = exact_inc_raw - dr_raw_proxy
+        gap_raw_inc_pct = 100 * gap_raw_inc / max(abs(exact_inc_raw), 1e-9)
+
+    # -------------------------
+    # BUILD ROW
+    # -------------------------
+    row = {
+        "Instance": Path(CSV_NAME).stem,
+        "Policy": policy,
+        "N": N,
+        "M": M,
+        "T": T,
+        "seed": seed,
+
+        # ===== EXACT =====
+        "Exact_aligned": exact_aligned,
+        "Exact_incumbent_raw": exact_inc_raw,
+        "Exact_bound_raw": exact_bound_raw,
+        "Exact_gap_raw": exact_gap_raw,
+
+        # ===== DR =====
+        "DR_aligned": dr_aligned,
+        "DR_iters": len(dr_out.get("DR_trace", [])),
+
+        # ===== GAPS =====
+        "Gap_aligned": gap_aligned,
+        "Gap_aligned_%": gap_aligned_pct,
+
+        "Gap_raw_inc": gap_raw_inc,
+        "Gap_raw_inc_%": gap_raw_inc_pct,
+
+        # ===== TIME =====
+        "DR_time": t_dr_end - t_dr_start,
+        "Exact_time": t_exact_end - t_exact_start,
+        "Total_time": t_global_end - t_global_start,
+    }
+
+    df_new = pd.DataFrame([row])
+
+    # enforce consistent columns
+    cols = list(row.keys())
+    df_new = df_new[cols]
+
+    # -------------------------
+    # APPEND SAFELY
+    # -------------------------
+    if excel_file.exists():
+        try:
+            df_old = pd.read_excel(excel_file)
+
+            # 🔥 FORCE SAME COLUMNS WITHOUT RESETTING FILE
+            for col in df_new.columns:
+                if col not in df_old.columns:
+                    df_old[col] = None
+
+            for col in df_old.columns:
+                if col not in df_new.columns:
+                    df_new[col] = None
+
+            # reorder columns
+            df_new = df_new[df_old.columns]
+
+            df_all = pd.concat([df_old, df_new], ignore_index=True)
+
+        except Exception as e:
+            print("⚠️ Could not read Excel, creating new one:", e)
+            df_all = df_new
+    else:
+        df_all = df_new
+
+    df_all.to_excel(excel_file, index=False)
+
+    print(f"📊 Updated Excel → {excel_file}")
+    # =========================
+    # DR CURVE (OPTIONAL CLEAN)
+    # =========================
+    trace = dr_out.get("DR_trace")
+
+    if trace is not None and not trace.empty:
+
+        x = trace["iteration"].to_numpy()
+
+        current = (
+            trace["current"].to_numpy()
+            if "current" in trace.columns
+            else trace["proxy_curr"].to_numpy()
+        )
+
+        best = trace["best_full"].ffill().to_numpy()
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(x, current, alpha=0.4, label="DR current")
+        plt.plot(x, best, linewidth=2, label="DR best")
+        plt.axhline(y=exact_obj, linestyle="--", linewidth=2,
+                    label=f"Exact ({exact_obj:.1f})")
+
+        plt.xlabel("Iteration")
+        plt.ylabel("Objective")
+        plt.title(f"DR vs Exact | N={N}, T={T}, seed={seed}")
+        plt.grid(True)
+        plt.legend()
+
+        plt.show()  # no file saving → clean workflow
 # =========================
-# RUN
+# ENTRY
 # =========================
-print("Running DR...")
-t0 = time.time()
-
-
-# 🔥 Build DR-compatible demand (T, N)
-demand_DR = inst["demand_I"].reshape(1, -1)   # (1, N)
-
-inst_DR = inst.copy()
-inst_DR["demand_IT"] = demand_DR   # shape (1, N)
-
-dr_out = dr.run_DR_multi(
-    inst=inst_DR,
-    policy=policy,
-    P_T=[sum(P_T)],   # collapse periods
-    Q=Q,
-    D=1.0,
-    T=1,
-    max_iter=max_iter,
-    dr_time_limit=dr_time_limit,
-    seed=11,
-    max_chargers_per_site=max_chargers_per_site
-)
-
-dr_best = dr_out.get("best_obj", None)
-
-print("Running Exact...")
-
-model = build_multi_period_model(
-    M=M,
-    N=N,
-    T=T,
-    in_range=Arcs,
-    Ji=Ji,
-    Ij=Ij,
-    demand_IT=demand,
-    Q=Q,
-    P_T=P_T,
-    distIJ=dist,
-    method_name=policy,
-    allow_multi_charger=True,
-    max_chargers_per_site=max_chargers_per_site
-)
-res = solve_model(
-    model,
-    time_limit=exact_time_limit
-)
-
-exact_obj = res.best_feasible_objective
-
-t1 = time.time()
-
-# =========================
-# SAVE RESULTS
-# =========================
-gap = None
-if dr_best and exact_obj:
-    gap = (exact_obj - dr_best) / exact_obj
-
-df = pd.DataFrame([{
-    "instance": CSV_NAME,
-    "DR_best": dr_best,
-    "Exact_obj": exact_obj,
-    "gap": gap,
-    "runtime_s": t1 - t0
-}])
-
-outfile = RESULTS_DIR / f"result_{Path(CSV_NAME).stem}.csv"
-df.to_csv(outfile, index=False)
-
-print("Done!")
-print(f"Saved to: {outfile}")
+if __name__ == "__main__":
+    run_single_experiment()
