@@ -138,7 +138,6 @@ def run_single_experiment():
         Ij=Ij,
         demand_IT=demand_IT,
         Q=Q,
-        D=D,
         P_T=P_T_local,
         distIJ=distIJ,
         method_name=policy,

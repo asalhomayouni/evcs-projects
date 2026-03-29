@@ -1508,12 +1508,12 @@ def run_DR_multi(
                 best_full_score = best_batch_score
                 U_best = dict(best_batch_U)
 
-    # ADD at bottom of the for-loop body:
-    trace_records.append({
-        "iteration": it,
-        "current": float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
-        "best_full": float(best_full_score),
-    })
+        # ADD at bottom of the for-loop body:
+        trace_records.append({
+                "iteration": it,
+                "current": float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
+                "best_full": float(best_full_score),
+            })
 
     return {
         "U_best": U_best,
