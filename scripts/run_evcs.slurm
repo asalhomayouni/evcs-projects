@@ -19,6 +19,8 @@ module load gurobi/10.0.3
 
 source ~/EVCS-PROJECTS/venv/bin/activate
 
+export GRB_LICENSE_FILE=/cvmfs/restricted.computecanada.ca/config/licenses/gurobi/clusters/narval.lic
+
 echo "Job ID    : $SLURM_JOB_ID"
 echo "Node      : $SLURMD_NODENAME"
 echo "Start     : $(date)"
