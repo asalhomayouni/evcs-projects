@@ -32,10 +32,10 @@ RESULTS_DIR.mkdir(exist_ok=True)
 CSV_NAME = "center_240_Parma_k200.csv"
 D =0.02
 T = 6
-P_T = [2,2,1,2,1,2]
+P_T = [10,10,10,10,10,10]
 policy = "closest_priority"
-Q = 20
-max_chargers_per_site = 5
+Q = 500
+max_chargers_per_site = 20
 
 # DR
 max_iter = 100
