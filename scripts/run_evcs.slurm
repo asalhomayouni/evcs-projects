@@ -1,4 +1,4 @@
-nano scripts/run_evcs.slurm#!/bin/bash
+#!/bin/bash
 #SBATCH --job-name=evcs_run
 #SBATCH --account=def-tms
 #SBATCH --time=02:00:00
@@ -19,7 +19,6 @@ module load gurobi/10.0.3
 
 source ~/EVCS-PROJECTS/venv/bin/activate
 
-python -c "import gurobipy; gurobipy.Model(); print('Gurobi license OK')"
 echo "Job ID    : $SLURM_JOB_ID"
 echo "Node      : $SLURMD_NODENAME"
 echo "Start     : $(date)"
