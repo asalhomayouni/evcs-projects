@@ -793,11 +793,15 @@ def greedy_schedule_multi_from_variants(
     U=None,                  # max chargers per site (cap), optional
     mode="aggregate_then_fill",  # aggregate_then_fill | per_period
 ):
- 
+    
     demand_IT = inst["demand_IT"]
     coords_J = inst["coords_J"]
     T = len(P_T)
     N = len(coords_J)
+
+    demand_arr = np.asarray(demand_IT, dtype=float)
+    if demand_arr.ndim == 2 and demand_arr.shape[0] != T:
+        demand_arr = demand_arr.T
 
     # initialize schedule dict
     U0 = {(j, t): 0 for j in range(N) for t in range(T)}
@@ -848,14 +852,7 @@ def greedy_schedule_multi_from_variants(
     # -------------------------
     # aggregate_then_fill (default)
     # -------------------------
-
-    # 1) aggregate demand over time
-    demand_arr = np.asarray(demand_IT, dtype=float)
-    # Canonicalize to (T, M): sum over time axis to get per-node aggregate
-    if demand_arr.ndim == 2 and demand_arr.shape[0] != len(P_T):
-        # shape is (M, T) — transpose first
-        demand_arr = demand_arr.T
-    d_agg = np.sum(demand_arr, axis=0)   # sum over T rows → shape (M,)
+    d_agg = np.sum(demand_arr, axis=0) # sum over T rows → shape (M,)
 
     inst_agg = {
         "coords_I": inst["coords_I"],
