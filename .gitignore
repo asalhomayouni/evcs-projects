@@ -1,0 +1,11 @@
+venv/
+logs/
+results/
+__pycache__/
+*.pyc
+*.pyo
+*.npz
+*.xlsx
+*.png
+.DS_Store
+evcs-projects/
