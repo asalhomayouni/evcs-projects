@@ -814,7 +814,7 @@ def greedy_schedule_multi_from_variants(
             inst_t = {
                 "coords_I": inst["coords_I"],
                 "coords_J": inst["coords_J"],
-                "demand_I": demand_IT[t],
+                "demand_I": demand_arr[t],
             }
             x_t = greedy_init_simple_variants(
                 inst_t,
@@ -850,7 +850,12 @@ def greedy_schedule_multi_from_variants(
     # -------------------------
 
     # 1) aggregate demand over time
-    d_agg = np.sum(np.array(demand_IT, dtype=float), axis=0)  # shape (M,)
+    demand_arr = np.asarray(demand_IT, dtype=float)
+    # Canonicalize to (T, M): sum over time axis to get per-node aggregate
+    if demand_arr.ndim == 2 and demand_arr.shape[0] != len(P_T):
+        # shape is (M, T) — transpose first
+        demand_arr = demand_arr.T
+    d_agg = np.sum(demand_arr, axis=0)   # sum over T rows → shape (M,)
 
     inst_agg = {
         "coords_I": inst["coords_I"],

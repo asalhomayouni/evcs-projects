@@ -17,7 +17,7 @@ from evcs import (
     solve_model,
     run_DR_multi
 )
-
+ 
 from evcs.methods import sync_solution_state, reassign_y_greedy_multi
 import matplotlib.pyplot as plt
 
@@ -30,7 +30,7 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 CSV_NAME = "center_240_Parma_k200.csv"
-
+D = 3
 T = 6
 P_T = [2,2,1,2,1,2]
 policy = "closest_priority"
@@ -63,7 +63,7 @@ def run_single_experiment():
     # -------------------------
     # LOAD
     # -------------------------
-    inst = load_instance(DATA_DIR / CSV_NAME)
+    inst = load_instance(DATA_DIR / CSV_NAME, radius=D)
 
     M, N = inst["M"], inst["N"]
     Ji, Ij = inst["Ji"], inst["Ij"]
@@ -108,7 +108,7 @@ def run_single_experiment():
         policy=policy,
         P_T=P_T_local, 
         Q=Q,
-        D=3,
+        D=D,
         T=T,
         max_iter=max_iter,
         dr_time_limit=dr_time_limit,
@@ -138,20 +138,12 @@ def run_single_experiment():
         Ij=Ij,
         demand_IT=demand_IT,
         Q=Q,
+        D=D,
         P_T=P_T_local,
         distIJ=distIJ,
         method_name=policy,
         max_chargers_per_site=max_chargers_per_site
     )
-
-    solve_model(
-        model,
-        time_limit=exact_time_limit,
-        mip_gap=mip_gap,
-        solver_name="gurobi"
-    )
-
-    t_exact_end = time.time()
 
     res = solve_model(
         model,
@@ -159,6 +151,8 @@ def run_single_experiment():
         mip_gap=mip_gap,
         solver_name="gurobi"
     )
+
+    t_exact_end = time.time()
 
     exact_inc_raw = getattr(res, "best_feasible_objective", None)
     exact_bound_raw = getattr(res, "best_objective_bound", None)
@@ -213,19 +207,14 @@ def run_single_experiment():
 
     print(f"Exact obj = {exact_obj:.2f}")
 
-    # -------------------------
-    # GAP
-    # -------------------------
-    gap = (exact_obj - dr_best) / exact_obj if exact_obj > 0 else None
-
-    # -------------------------
     # SAVE + REPORT (CLEAN)
 
     t_global_end = time.time()
 
     # ---- Summary numbers ----
-    gap = exact_obj - dr_best
-    gap_pct = 100 * gap / max(exact_obj, 1e-9)
+    gap_abs = exact_obj - dr_best
+    gap_pct = 100 * gap_abs / max(exact_obj, 1e-9)
+    gap_rel = gap_abs / max(exact_obj, 1e-9)   # fractional gap for logging
     total_demand = float(demand_IT.sum())
 
     # =========================
@@ -237,7 +226,7 @@ def run_single_experiment():
     print(f"Policy   : {policy}")
     print(f"DR best  : {dr_best:.4f}")
     print(f"Exact    : {exact_obj:.4f}")
-    print(f"Gap      : {gap:.4f} ({gap_pct:.2f}%)")
+    print(f"Gap      : {gap_abs:.4f} ({gap_pct:.2f}%)")
     print(f"Time DR  : {t_dr_end - t_dr_start:.2f}s")
     print(f"Time EX  : {t_exact_end - t_exact_start:.2f}s")
     print("=====================\n")
@@ -293,7 +282,7 @@ def run_single_experiment():
         "DR_iters": len(dr_out.get("DR_trace", [])),
 
         # ===== GAPS =====
-        "Gap_aligned": gap_aligned,
+        "Gap_aligned": gap_aligned, 
         "Gap_aligned_%": gap_aligned_pct,
 
         "Gap_raw_inc": gap_raw_inc,
@@ -341,36 +330,56 @@ def run_single_experiment():
     df_all.to_excel(excel_file, index=False)
 
     print(f"📊 Updated Excel → {excel_file}")
+   
+    # DR vs EXACT PLOT (FIXED)
     # =========================
-    # DR CURVE (OPTIONAL CLEAN)
-    # =========================
+    import matplotlib
+    matplotlib.use("Agg")  # 🔥 REQUIRED on Narval
+
     trace = dr_out.get("DR_trace")
 
-    if trace is not None and not trace.empty:
+    if trace is not None and len(trace) > 0:
 
         x = trace["iteration"].to_numpy()
 
-        current = (
-            trace["current"].to_numpy()
-            if "current" in trace.columns
-            else trace["proxy_curr"].to_numpy()
-        )
+        # current (fluctuating)
+        if "current" in trace.columns:
+            current = trace["current"].to_numpy()
+        else:
+            current = trace["proxy_curr"].to_numpy()
 
-        best = trace["best_full"].ffill().to_numpy()
+        # best-so-far
+        if "best_full" in trace.columns:
+            best = trace["best_full"].ffill().to_numpy()
+        else:
+            best = trace["best"].ffill().to_numpy()
 
         plt.figure(figsize=(8, 5))
-        plt.plot(x, current, alpha=0.4, label="DR current")
-        plt.plot(x, best, linewidth=2, label="DR best")
-        plt.axhline(y=exact_obj, linestyle="--", linewidth=2,
-                    label=f"Exact ({exact_obj:.1f})")
 
-        plt.xlabel("Iteration")
-        plt.ylabel("Objective")
-        plt.title(f"DR vs Exact | N={N}, T={T}, seed={seed}")
+        plt.plot(x, current, alpha=0.4, label="DR fluctuating (current)")
+        plt.plot(x, best, linewidth=2, label="DR best-so-far (best_full)")
+
+        plt.axhline(
+            y=exact_obj,
+            linestyle="--",
+            linewidth=2,
+            label=f"Exact ({exact_obj:.3f})"
+        )
+
+        plt.xlabel("iteration")
+        plt.ylabel("Score")
+
+        plt.title(f"DR vs Exact | N={N}, T={T}, seed={seed} | policy={policy}")
+
         plt.grid(True)
         plt.legend()
 
-        plt.show()  # no file saving → clean workflow
+        plot_path = RESULTS_DIR / f"dr_curve_{Path(CSV_NAME).stem}.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+
+        print(f"📈 Plot saved → {plot_path}")
+
+        plt.close()
 # =========================
 # ENTRY
 # =========================

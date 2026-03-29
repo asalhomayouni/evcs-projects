@@ -1083,12 +1083,7 @@ def evaluate_u_numpy_greedy(
     cumulative_install=True,
     pre_sorted_J_i=None,
 ):
-    """
-    Greedy evaluation with demand splitting across feasible sites subject to capacity.
-
-    Expected demand orientation: demand_IT[i, t] (shape (M, T)).
-    U_dict keys are assumed to be (j, t).
-    """
+    
     cap = _u_to_capacity_array(U_dict, T=T, N=N, Q_cap=Q_cap, cumulative_install=cumulative_install)
 
     covered = 0.0
@@ -1360,7 +1355,7 @@ def run_DR_multi(
         Ij_int[j].append(i)
         Ji_int[i].append(j)
 
-    J_i_list = [sorted(Ji_int[i], key=lambda j: distIJ[(i, j)]) for i in range(M)]
+    J_i_list = [sorted(Ji_int[i], key=lambda j: float(distIJ[i, j])) for i in range(M)]
 
     # -------------------------
     # Model template
@@ -1409,6 +1404,7 @@ def run_DR_multi(
     # =========================
     # MAIN LOOP (LEFT FLOWCHART)
     # =========================
+    trace_records = [] 
     for it in range(max_iter):
 
         if time.perf_counter() - t_start > dr_time_limit:
@@ -1427,9 +1423,15 @@ def run_DR_multi(
                 base, inst, rng, P_T, frac_remove, destroy_mode
             )
 
+            U_cap_per_site = (
+                int(max_chargers_per_site)
+                if max_chargers_per_site is not None
+                else int(max(P_T))          # fallback: no single period can have more than one period's budget
+            )
+
             U_recon, _ = reconstruct_u_dict_fast(
                 U_partial, demand_TM, P_T, Ij_int,
-                U_cap = int(max(P_T) * T), Q=Q_cap, rng=rng
+                U_cap=U_cap_per_site, Q=Q_cap, rng=rng
             )
 
             h = hash_u(U_recon)
@@ -1506,10 +1508,18 @@ def run_DR_multi(
                 best_full_score = best_batch_score
                 U_best = dict(best_batch_U)
 
+    # ADD at bottom of the for-loop body:
+    trace_records.append({
+        "iteration": it,
+        "current": float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
+        "best_full": float(best_full_score),
+    })
+
     return {
         "U_best": U_best,
         "best_obj": best_full_score,
         "time": time.perf_counter() - t_start,
+        "DR_trace": pd.DataFrame(trace_records),
     }
 
 
