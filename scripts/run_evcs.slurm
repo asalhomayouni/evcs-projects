@@ -14,6 +14,7 @@ mkdir -p logs
 module purge
 module load StdEnv/2023
 module load python/3.11
+module load scipy-stack
 module load gurobi/10.0.3
 
 source ~/EVCS-PROJECTS/venv/bin/activate
