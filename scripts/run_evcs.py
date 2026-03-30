@@ -31,8 +31,8 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 CSV_NAME = "center_240_Parma_k200.csv"
 D =0.02
-T = 6
-P_T = [5,5,5,5,5,5,5,5]
+T = 4
+P_T = [5,5,5,5]
 policy = "closest_priority"
 Q = 500
 max_chargers_per_site = 20
@@ -49,7 +49,7 @@ adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
-exact_time_limit = 10000
+exact_time_limit = 600
 mip_gap = 1e-4
 
 
@@ -83,7 +83,8 @@ def run_single_experiment():
 
     # T from data
     T_data = demand_IT.shape[0]
-    T = T_data
+    T = min(T, T_data)   # use CONFIG T=4, not data T=8
+    demand_IT = demand_IT[:T, :] 
 
     # ✅ MAKE LOCAL COPY (IMPORTANT)
     P_T_local = list(P_T)
