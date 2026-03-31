@@ -49,7 +49,11 @@ adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
+<<<<<<< HEAD
 exact_time_limit = 1800
+=======
+exact_time_limit = 600
+>>>>>>> eb6485441a2810d973361936d1effee409ecb622
 mip_gap = 1e-4
 
 
@@ -83,9 +87,14 @@ def run_single_experiment():
 
     # T from data
     T_data = demand_IT.shape[0]
+<<<<<<< HEAD
     T = min(T, T_data)   # use CONFIG T=4, not data T=8
     demand_IT = demand_IT[:T, :] 
 
+=======
+	T = min(T, T_data)
+	demand_IT = demand_IT[:T, :]
+>>>>>>> eb6485441a2810d973361936d1effee409ecb622
     # ✅ MAKE LOCAL COPY (IMPORTANT)
     P_T_local = list(P_T)
 
