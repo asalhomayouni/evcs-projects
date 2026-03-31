@@ -49,7 +49,7 @@ adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
-exact_time_limit = 1800
+exact_time_limit = 3600
 mip_gap = 1e-4
 
 
