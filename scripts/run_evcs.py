@@ -83,8 +83,9 @@ def run_single_experiment():
 
     # T from data
     T_data = demand_IT.shape[0]
-    T = min(T, T_data)   
-    demand_IT = demand_IT[:T, :] 
+    T = min(T, T_data)
+    T_config = T
+    demand_IT = demand_IT[:T, :]
 
     # ✅ MAKE LOCAL COPY (IMPORTANT)
     P_T_local = list(P_T)
