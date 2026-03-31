@@ -31,14 +31,14 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 CSV_NAME = "center_240_Parma_k200.csv"
 D =0.02
-T = 4
-P_T = [5,5,5,5]
+T = 3
+P_T = [3,3,3]
 policy = "closest_priority"
 Q = 500
-max_chargers_per_site = 20
+max_chargers_per_site = 10
 
 # DR
-max_iter = 50
+max_iter = 30
 dr_time_limit = 600
 seed = 11
 batch_size = 20   
@@ -49,7 +49,7 @@ adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
-exact_time_limit = 8000
+exact_time_limit = 1800
 mip_gap = 1e-4
 
 
