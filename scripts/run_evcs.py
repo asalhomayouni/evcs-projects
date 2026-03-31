@@ -30,7 +30,7 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 CSV_NAME = "center_240_Parma_k200.csv"
-D =0.02
+D =0.005
 T = 3
 P_T = [3,3,3]
 policy = "closest_priority"
