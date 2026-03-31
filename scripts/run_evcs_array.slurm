@@ -11,6 +11,7 @@
 #SBATCH --mail-user=asalhmy7@yorku.ca
 
 set -euo pipefail
+trap 'echo "[$(date)] Job ${SLURM_ARRAY_TASK_ID} failed with exit code $?"; exit 1' ERR
 
 mkdir -p logs
 
