@@ -57,6 +57,7 @@ mip_gap = 1e-4
 # MAIN
 # =========================
 def run_single_experiment():
+    global T, P_T, seed  
 
     print("Starting EVCS experiment")
     t_global_start = time.time()
