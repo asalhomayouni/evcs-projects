@@ -38,7 +38,7 @@ Q = 500
 max_chargers_per_site = 10
 
 # DR
-max_iter = 30
+max_iter = 200
 dr_time_limit = 600
 seed = 11
 batch_size = 20   
@@ -49,8 +49,8 @@ adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact
-exact_time_limit = 3600
-mip_gap = 1e-4
+exact_time_limit = 300
+mip_gap = 0.001
 
 
 # =========================

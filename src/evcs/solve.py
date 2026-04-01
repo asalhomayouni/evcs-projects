@@ -77,7 +77,7 @@ def _solve_with_gurobi(
 
     n_threads = threads
     if n_threads is None:
-        n_threads = max(1, (os.cpu_count() or 2) - 1)
+        n_threads = 2   # match SLURM cpus-per-task
 
     opt.options["TimeLimit"] = float(time_limit)
     opt.options["MIPGap"] = float(mip_gap)
