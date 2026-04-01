@@ -160,6 +160,14 @@ def run_single_experiment():
     dr_best = dr_out["best_obj"]
     print(f"DR best = {dr_best:.2f}")
 
+    U_best = dr_out["U_best"]
+    total_chargers = sum(U_best.values())
+    total_capacity = total_chargers * Q
+    print(f"DEBUG total chargers installed: {total_chargers}")
+    print(f"DEBUG total capacity: {total_capacity:.1f}")
+    print(f"DEBUG total demand: {demand_IT.sum():.1f}")
+    print(f"DEBUG max possible coverage: {min(total_capacity, demand_IT.sum()):.1f}")
+
     # -------------------------
     # EXACT
     # -------------------------
