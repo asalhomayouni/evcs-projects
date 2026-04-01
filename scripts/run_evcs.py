@@ -42,21 +42,38 @@ DATA_DIR = PROJECT_ROOT / "data" / "input"
 RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
+# =========================
+# ARGUMENTS
+# =========================
+parser = argparse.ArgumentParser()
+parser.add_argument("--csv",  type=str,   default="center_240_Parma_k200.csv")
+parser.add_argument("--seed", type=int,   default=11)
+parser.add_argument("--D",    type=float, default=0.5)
+parser.add_argument("--T",    type=int,   default=3)
+parser.add_argument("--Q",    type=float, default=20.0)
+args = parser.parse_args()
+
+# =========================
+# CONFIG
+# =========================
 CSV_NAME              = args.csv
 D                     = args.D
 T                     = args.T
-P_T                   = [8] * T        # ← always matches T
+P_T                   = [8] * T     # always correct length
 policy                = "closest_priority"
 Q                     = args.Q
 max_chargers_per_site = 6
 seed                  = args.seed
 
 # DR
-max_iter      = 200
-dr_time_limit = 600
-batch_size    = 20
+max_iter      = 500
+dr_time_limit = 1200
+batch_size    = 50
+top_k_full    = 8     # add this parameter
+ls_moves      = 12    # add this parameter
+ls_frac_remove = 0.08 # add this parameter
 frac_remove   = 0.3
-accept_epsilon = 0.01
+accept_epsilon = 0.001
 adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
 
