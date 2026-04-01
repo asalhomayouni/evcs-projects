@@ -6,6 +6,7 @@ import time
 import pandas as pd
 import sys
 import numpy as np
+import argparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -17,10 +18,22 @@ from evcs import (
     solve_model,
     run_DR_multi
 )
- 
-from evcs.methods import sync_solution_state, reassign_y_greedy_multi
-import matplotlib.pyplot as plt
 
+from evcs.methods import sync_solution_state, reassign_y_greedy_multi
+from evcs.geom import build_arcs
+import matplotlib.pyplot as plt
+from evcs.geom import build_arcs
+
+# =========================
+# ARGUMENTS
+# =========================
+parser = argparse.ArgumentParser()
+parser.add_argument("--csv",  type=str,   default="center_240_Parma_k200.csv")
+parser.add_argument("--seed", type=int,   default=11)
+parser.add_argument("--D",    type=float, default=0.5)
+parser.add_argument("--T",    type=int,   default=3)
+parser.add_argument("--Q",    type=float, default=20.0)
+args = parser.parse_args()
 
 # =========================
 # CONFIG
@@ -29,21 +42,20 @@ DATA_DIR = PROJECT_ROOT / "data" / "input"
 RESULTS_DIR = PROJECT_ROOT / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-CSV_NAME = "center_240_Parma_k200.csv"
-D =0.005
-T = 3
-P_T = [3,3,3]
-policy = "closest_priority"
-Q = 500
-max_chargers_per_site = 10
+CSV_NAME              = args.csv
+D                     = args.D
+T                     = args.T
+P_T                   = [8] * T        # ← always matches T
+policy                = "closest_priority"
+Q                     = args.Q
+max_chargers_per_site = 6
+seed                  = args.seed
 
 # DR
-max_iter = 200
+max_iter      = 200
 dr_time_limit = 600
-seed = 11
-batch_size = 20   
-
-frac_remove = 0.3
+batch_size    = 20
+frac_remove   = 0.3
 accept_epsilon = 0.01
 adaptive_destroy = True
 destroy_modes = ["site_swap", "local_remove", "area_destroy"]
@@ -66,40 +78,50 @@ def run_single_experiment():
     # LOAD
     # -------------------------
     inst = load_instance(DATA_DIR / CSV_NAME, radius=D)
+    inst["coords_I"] = inst["coords_I"].copy()
+    inst["coords_J"] = inst["coords_J"].copy()
+    inst["coords_I"][:, 0] *= 111.0
+    inst["coords_I"][:, 1] *= 111.0
+    inst["coords_J"][:, 0] *= 111.0
+    inst["coords_J"][:, 1] *= 111.0
+
+    # FIX 2: Rebuild arcs with km coordinates
+    distIJ, in_range, Ji, Ij = build_arcs(
+        inst["coords_I"], inst["coords_J"], D=D
+    )
+    inst["distIJ"] = distIJ
+    inst["in_range"] = in_range
+    inst["Ji"]  = Ji
+    inst["Ij"]  = Ij
 
     M, N = inst["M"], inst["N"]
-    Ji, Ij = inst["Ji"], inst["Ij"]
-    distIJ = inst["distIJ"]
-    in_range = inst["in_range"]
-    demand_IT = inst["demand_IT"]
 
-   
-    # Demand handling (ROBUST)
-    # -------------------------
+    # FIX 3: Normalize demand like notebook
     demand_IT = np.asarray(inst["demand_IT"], dtype=float)
-
-    # Fix orientation
     if demand_IT.shape[0] == M:
-        demand_IT = demand_IT.T
+        demand_IT = demand_IT.T   # ensure (T, M)
+
+    for t in range(demand_IT.shape[0]):
+        period_sum = demand_IT[t].sum()
+        if period_sum > 0:
+            demand_IT[t] = demand_IT[t] / period_sum * M
 
     # T from data
     T_data = demand_IT.shape[0]
     T_config = T
     T = min(T_config, T_data)
     demand_IT = demand_IT[:T, :]
-    # ✅ MAKE LOCAL COPY (IMPORTANT)
-    P_T_local = list(P_T)
-
-    # Align P_T safely
-    if len(P_T_local) > T:
-        P_T_local = P_T_local[:T]
-    elif len(P_T_local) < T:
-        P_T_local = P_T_local + [P_T_local[-1]] * (T - len(P_T_local))
 
     inst["demand_IT"] = demand_IT
 
+    # Align P_T
+    P_T_local = [8] * T
+
     print("FINAL SHAPE:", demand_IT.shape)
     print("Using T =", T)
+    print("Total demand per period:", [round(float(demand_IT[t].sum()), 2) for t in range(T)])
+    print("Total capacity Q x sum(P_T):", Q * sum(P_T_local))
+
     # -------------------------
     # DR
     # -------------------------
