@@ -22,18 +22,7 @@ from evcs import (
 from evcs.methods import sync_solution_state, reassign_y_greedy_multi
 from evcs.geom import build_arcs
 import matplotlib.pyplot as plt
-from evcs.geom import build_arcs
 
-# =========================
-# ARGUMENTS
-# =========================
-parser = argparse.ArgumentParser()
-parser.add_argument("--csv",  type=str,   default="center_240_Parma_k200.csv")
-parser.add_argument("--seed", type=int,   default=11)
-parser.add_argument("--D",    type=float, default=0.5)
-parser.add_argument("--T",    type=int,   default=3)
-parser.add_argument("--Q",    type=float, default=20.0)
-args = parser.parse_args()
 
 # =========================
 # CONFIG
@@ -160,6 +149,10 @@ def run_single_experiment():
         accept_epsilon=accept_epsilon,
         adaptive_destroy=adaptive_destroy,
         destroy_modes=destroy_modes,
+        batch_size=batch_size,        # ← ADD
+        top_k_full=top_k_full,        # ← ADD
+        ls_moves=ls_moves,            # ← ADD
+        ls_frac_remove=ls_frac_remove, # ← ADD
     )
 
     t_dr_end = time.time()
