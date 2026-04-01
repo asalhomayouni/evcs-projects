@@ -3,7 +3,7 @@
 #SBATCH --account=def-tms
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=16G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --array=1-8
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
