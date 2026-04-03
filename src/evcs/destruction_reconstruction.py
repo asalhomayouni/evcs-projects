@@ -1409,6 +1409,7 @@ def run_DR_multi(
     U_best = dict(U_curr)
 
     seen = set()
+    seen_max = 2000  # cap: once full, stop deduplication so DR keeps exploring
     def hash_u(U):
         return tuple(sorted(U.items()))
 
@@ -1450,9 +1451,10 @@ def run_DR_multi(
             )
 
             h = hash_u(U_recon)
-            if h in seen:
+            if len(seen) < seen_max and h in seen:
                 continue
-            seen.add(h)
+            if len(seen) < seen_max:
+                seen.add(h)
 
             proxy = evaluate_u_numpy_greedy_binary(
                 U_recon, demand_TM, J_i_list, distIJ,
