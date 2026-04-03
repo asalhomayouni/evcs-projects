@@ -508,6 +508,14 @@ def run_one_policy_multi(
             exact_has_feasible = False
 
         if exact_has_feasible:
+            # Sync z from u/x, then greedily reassign y — same pattern as greedy/DR evaluation
+            sync_solution_state(m_exact, cumulative_install=cumulative_install)
+            reassign_y_greedy_multi(
+                m_exact, distIJ, Ji=Ji,
+                method_name=policy,
+                cumulative_install=cumulative_install,
+            )
+
             # aligned metric = covered demand only
             exact_score_aligned = float(
                 evaluate_solution_multi(m_exact, demand_TM)["covered_demand"]
