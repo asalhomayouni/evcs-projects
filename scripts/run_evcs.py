@@ -74,13 +74,7 @@ mip_gap          = 0.001
 # Identical to notebook build_inst_from_csv()
 # =========================
 def build_instance_from_csv(csv_path, T, seed, D_km):
-    """
-    Build instance exactly like the notebook does:
-    - coordinates converted degrees -> km
-    - demand normalized as population share * M
-    - seasonal noise added per period
-    - forbid_self=False (same as notebook)
-    """
+   
     df = pd.read_csv(csv_path)
 
     # coordinates degrees -> km
@@ -257,43 +251,56 @@ def run_single_experiment():
     # -------------------------
     # Evaluate EXACT with greedy assignment
     # (same evaluation method as DR uses)
+    # Only run if Gurobi actually found a feasible integer solution
     # -------------------------
-    U_exact = {
-        (j, t): int(round(model.u[j, t].value))
-        for j in model.J
-        for t in model.T
-    }
-
-    m_tmp = model.clone()
-    for (j, t), val in U_exact.items():
-        m_tmp.u[j, t].value = val
-
-    sync_solution_state(m_tmp, cumulative_install=True)
-    reassign_y_greedy_multi(
-        m_tmp, distIJ,
-        Ji=inst["Ji"],
-        method_name=policy,
-        cumulative_install=True,
+    exact_obj = None
+    exact_has_feasible = (
+        exact_inc_raw is not None
+        and any((model.u[j, t].value or 0) > 0.5 for j in model.J for t in model.T)
     )
 
-    exact_obj = 0.0
-    for t in m_tmp.T:
-        for i in m_tmp.I:
-            for j in inst["Ji"][i]:
-                val = m_tmp.y[i, j, t].value
-                if val is not None and val > 0.5:
-                    exact_obj += demand_IT[t, i]
-                    break
+    if exact_has_feasible:
+        U_exact = {
+            (j, t): int(round(model.u[j, t].value))
+            for j in model.J
+            for t in model.T
+        }
 
-    print(f"Exact obj = {exact_obj:.4f}")
+        m_tmp = model.clone()
+        for (j, t), val in U_exact.items():
+            m_tmp.u[j, t].value = val
+
+        sync_solution_state(m_tmp, cumulative_install=True)
+        reassign_y_greedy_multi(
+            m_tmp, distIJ,
+            Ji=inst["Ji"],
+            method_name=policy,
+            cumulative_install=True,
+        )
+
+        exact_obj = 0.0
+        for t in m_tmp.T:
+            for i in m_tmp.I:
+                for j in inst["Ji"][i]:
+                    val = m_tmp.y[i, j, t].value
+                    if val is not None and val > 0.5:
+                        exact_obj += demand_IT[t, i]
+                        break
+        print(f"Exact obj = {exact_obj:.4f}")
+    else:
+        print("Exact: no feasible integer solution found within time limit.")
 
     # -------------------------
     # RESULTS
     # -------------------------
     t_global_end = time.time()
 
-    gap_abs = exact_obj - dr_best
-    gap_pct = 100 * gap_abs / max(exact_obj, 1e-9)
+    if exact_obj is not None and exact_obj > 1e-9:
+        gap_abs = exact_obj - dr_best
+        gap_pct = 100 * gap_abs / exact_obj
+    else:
+        gap_abs = None
+        gap_pct = None
 
     print("\n===== RESULTS =====")
     print(f"Instance : {CSV_NAME}")
@@ -301,8 +308,8 @@ def run_single_experiment():
     print(f"Policy   : {policy}")
     print(f"seed     : {seed}")
     print(f"DR best  : {dr_best:.4f}")
-    print(f"Exact    : {exact_obj:.4f}")
-    print(f"Gap      : {gap_abs:.4f} ({gap_pct:.2f}%)")
+    print(f"Exact    : {exact_obj:.4f}" if exact_obj is not None else "Exact    : N/A (no feasible solution)")
+    print(f"Gap      : {gap_abs:.4f} ({gap_pct:.2f}%)" if gap_pct is not None else "Gap      : N/A")
     print(f"Time DR  : {t_dr_end - t_dr_start:.2f}s")
     print(f"Time EX  : {t_exact_end - t_exact_start:.2f}s")
     print(f"Time TOT : {t_global_end - t_global_start:.2f}s")
@@ -313,10 +320,10 @@ def run_single_experiment():
     # -------------------------
     excel_file = RESULTS_DIR / "benchmark_new_algorithm.xlsx"
 
-    exact_aligned    = exact_obj
+    exact_aligned    = exact_obj  # None if no feasible integer solution
     dr_aligned       = dr_best
-    gap_aligned      = exact_aligned - dr_aligned
-    gap_aligned_pct  = 100 * gap_aligned / max(exact_aligned, 1e-9)
+    gap_aligned      = (exact_aligned - dr_aligned) if exact_aligned is not None else None
+    gap_aligned_pct  = (100 * gap_aligned / exact_aligned) if (gap_aligned is not None and exact_aligned > 1e-9) else None
 
     gap_raw_inc      = None
     gap_raw_inc_pct  = None
