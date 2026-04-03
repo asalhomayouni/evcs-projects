@@ -315,73 +315,109 @@ def run_single_experiment():
     print(f"Time TOT : {t_global_end - t_global_start:.2f}s")
     print("=====================\n")
 
-    # -------------------------
-    # EXCEL LOG
-    # -------------------------
-    excel_file = RESULTS_DIR / "benchmark_new_algorithm.xlsx"
+    # EXCEL LOG — benchmark_with_SLURM.xlsx
+    # =========================
+    import pandas as pd
+    import numpy as np
+    from pathlib import Path
+    from datetime import datetime
 
-    exact_aligned    = exact_obj  # None if no feasible integer solution
-    dr_aligned       = dr_best
-    gap_aligned      = (exact_aligned - dr_aligned) if exact_aligned is not None else None
-    gap_aligned_pct  = (100 * gap_aligned / exact_aligned) if (gap_aligned is not None and exact_aligned > 1e-9) else None
+    # ---- output path ----
+    bench_dir  = PROJECT_ROOT / "results" / "benchmarking"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    excel_file = bench_dir / "benchmark_with_SLURM.xlsx"
 
-    gap_raw_inc      = None
-    gap_raw_inc_pct  = None
-    if exact_inc_raw is not None:
-        gap_raw_inc     = exact_inc_raw - dr_aligned
-        gap_raw_inc_pct = 100 * gap_raw_inc / max(abs(exact_inc_raw), 1e-9)
-
+    # ---- build row ----
     row = {
+        # run identity
+        "Timestamp":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Instance":             Path(CSV_NAME).stem,
         "Policy":               policy,
         "N":                    N,
         "M":                    M,
         "T":                    T,
         "seed":                 seed,
-        "D":                    D,
+        "D_km":                 D,
         "Q":                    Q,
-        # EXACT
-        "Exact_aligned":        exact_aligned,
+        "P_T":                  str(P_T_local),
+        "max_chargers_per_site": max_chargers_per_site,
+
+        # arcs
+        "|A|":                  len(in_range),
+        "arc_density":          round(len(in_range) / max(M * N, 1), 6),
+        "total_demand":         round(float(demand_IT.sum()), 4),
+
+        # exact
+        "Exact_aligned":        round(exact_obj, 4),
         "Exact_incumbent_raw":  exact_inc_raw,
         "Exact_bound_raw":      exact_bound_raw,
         "Exact_gap_raw":        exact_gap_raw,
+        "Exact_time_s":         round(t_exact_end - t_exact_start, 2),
+
         # DR
-        "DR_aligned":           dr_aligned,
+        "DR_best":              round(dr_best, 4),
         "DR_iters":             len(dr_out.get("DR_trace", [])),
-        # GAPS
-        "Gap_aligned":          gap_aligned,
-        "Gap_aligned_%":        gap_aligned_pct,
-        "Gap_raw_inc":          gap_raw_inc,
-        "Gap_raw_inc_%":        gap_raw_inc_pct,
-        # TIME
-        "DR_time":              t_dr_end - t_dr_start,
-        "Exact_time":           t_exact_end - t_exact_start,
-        "Total_time":           t_global_end - t_global_start,
+        "DR_time_s":            round(t_dr_end - t_dr_start, 2),
+        "DR_time_limit_s":      dr_time_limit,
+        "batch_size":           batch_size,
+        "top_k_full":           top_k_full,
+        "ls_moves":             ls_moves,
+        "max_iter":             max_iter,
+        "frac_remove":          frac_remove,
+        "accept_epsilon":       accept_epsilon,
+
+        # gaps
+        "Gap_abs":              round(exact_obj - dr_best, 4),
+        "Gap_%":                round(100 * (exact_obj - dr_best) / max(exact_obj, 1e-9), 4),
+
+        # raw gaps
+        "Gap_raw_inc":          round(exact_inc_raw - dr_best, 4) if exact_inc_raw is not None else None,
+        "Gap_raw_inc_%":        round(100 * (exact_inc_raw - dr_best) / max(abs(exact_inc_raw), 1e-9), 4) if exact_inc_raw is not None else None,
+
+        # timing
+        "Total_time_s":         round(t_global_end - t_global_start, 2),
     }
 
     df_new = pd.DataFrame([row])
-    cols   = list(row.keys())
-    df_new = df_new[cols]
 
+    # ---- append to existing or create new ----
     if excel_file.exists():
         try:
             df_old = pd.read_excel(excel_file)
+
+            # add any new columns that did not exist before
             for col in df_new.columns:
                 if col not in df_old.columns:
-                    df_old[col] = None
+                    df_old[col] = np.nan
+
+            # add any old columns missing in new row
             for col in df_old.columns:
                 if col not in df_new.columns:
-                    df_new[col] = None
+                    df_new[col] = np.nan
+
+            # keep column order consistent
             df_new = df_new[df_old.columns]
             df_all = pd.concat([df_old, df_new], ignore_index=True)
+
         except Exception as e:
-            print(f"⚠️ Could not read Excel, creating new: {e}")
+            print(f"⚠️ Could not read existing Excel, creating new: {e}")
             df_all = df_new
     else:
         df_all = df_new
 
-    df_all.to_excel(excel_file, index=False)
-    print(f"📊 Excel updated → {excel_file}")
+    # ---- save ----
+    try:
+        with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
+            df_all.to_excel(writer, sheet_name="benchmark", index=False)
+        print(f"📊 Excel updated → {excel_file}")
+        print(f"   Total rows: {len(df_all)}")
+    except PermissionError:
+        # file is open in Excel — save with timestamp
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt = excel_file.with_name(f"benchmark_with_SLURM_LOCKED_{stamp}.xlsx")
+        with pd.ExcelWriter(alt, engine="openpyxl", mode="w") as writer:
+            df_all.to_excel(writer, sheet_name="benchmark", index=False)
+        print(f"⚠️ File was open — saved as: {alt}")
 
     # -------------------------
     # SAVE TRACE CSV for local plotting

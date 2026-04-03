@@ -1,2 +1,0 @@
-instance,policy,seed,N,M,T,Q,max_chargers,DR_best,DR_time,Exact_obj,Exact_time,gap,total_runtime
-center_100_Brescia_k175.csv,closest_priority,11,175,175,6,20,5,2026.0094242095947,338.672354221344,1474.8879806671143,8.818472862243652,-0.3736700351257861,347.508428812027

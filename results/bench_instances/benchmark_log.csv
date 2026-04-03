@@ -1,7 +1,0 @@
-Instance,Policy,N (sites J),M (demand I),T,seed,D,Exact incumbent score,Exact time (s),Exact termination,Exact gap,Exact bound,Exact feasible,Exact proven optimal,DR best score,DR iters,DR time limit (s),DR time (s),DR modes,Gap (Exact-DR),Gap %
-N100_M100_T6_seed11_D3.0,uniform,100,100,6,11,3,571.7574534,39.29395164,TerminationCondition.maxTimeLimit,,,TRUE,FALSE,600,65,20,,"site_swap,local_remove,area_destroy",-28.24254662,-4.939602703
-N100_M100_T6_seed11_D3.0,closest_only,100,100,6,11,3,14.15812335,1844.008633,TerminationCondition.maxTimeLimit,,,TRUE,FALSE,600,49,20,,"site_swap,local_remove,area_destroy",-585.8418766,-4137.849785
-N100_M100_T6_seed11_D3.0,closest_only,100,100,6,11,3,14.15812335,3617.385769,TerminationCondition.maxTimeLimit,,,TRUE,FALSE,600,41,20,,"site_swap,local_remove,area_destroy",-585.8418766,-4137.849785
-N125_M125_T6_seed11_D0.3,closest_only,125,125,6,11,0.3,381.5848299,0.5301172,TerminationCondition.optimal,,,TRUE,FALSE,326.738937,761,20,,"site_swap,local_remove,area_destroy",54.84589293,14.37318484
-N125_M125_T6_seed11_D0.3,closest_only,125,125,6,11,0.3,381.5848299,0.5043036,TerminationCondition.optimal,,,TRUE,FALSE,326.738937,952,20,,"site_swap,local_remove,area_destroy",54.84589293,14.37318484
-N125_M125_T6_seed11_D3,closest_only,125,125,6,11,3,2.031124889,3609.315514,TerminationCondition.maxTimeLimit,,,TRUE,FALSE,751.2291622,49,20,,"site_swap,local_remove,area_destroy",-749.1980373,-36885.8676
