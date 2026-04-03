@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"import json; nb = json.load\\(open\\('notebooks/multiperiod_integer.ipynb'\\)\\); cells = [c for c in nb['cells'] if c['cell_type'] == 'code']; [print\\(f'CELL {i}:\\\\\\\\n' + ''.join\\(c['source']\\) + f'\\\\\\\\n\\\\nOUTPUT: {c.get\\(\\\\\"execution_count\\\\\", \\\\\"\\\\\"\\)}\\\\\\\\n---'\\) for i, c in enumerate\\(cells\\)]\")"
+      "Bash(python3 -c \"import json; nb = json.load\\(open\\('notebooks/multiperiod_integer.ipynb'\\)\\); cells = [c for c in nb['cells'] if c['cell_type'] == 'code']; [print\\(f'CELL {i}:\\\\\\\\n' + ''.join\\(c['source']\\) + f'\\\\\\\\n\\\\nOUTPUT: {c.get\\(\\\\\"execution_count\\\\\", \\\\\"\\\\\"\\)}\\\\\\\\n---'\\) for i, c in enumerate\\(cells\\)]\")",
+      "Bash(python3)"
     ]
   }
 }

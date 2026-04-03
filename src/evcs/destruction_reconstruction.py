@@ -498,12 +498,19 @@ def run_one_policy_multi(
         exact_term = getattr(res, "termination_condition", None)
         proven_optimal_exact = (exact_term == TerminationCondition.optimal)
 
-        # Feasibility: trust loaded vars/model, not best_feasible_objective
+        # Feasibility: solver must have loaded an actual integer solution
+        # (u[j,t] is initialized to 0.0, so "not None" is always true — unreliable)
+        # Instead check best_feasible_objective AND that at least one u > 0
         try:
-            sample = None
-            if hasattr(m_exact, "u"):
-                sample = m_exact.u[0, 0].value
-            exact_has_feasible = (sample is not None)
+            bfo = getattr(res, "best_feasible_objective", None)
+            bfo_f = float(bfo) if bfo is not None else None
+            if bfo_f is not None:
+                exact_has_feasible = any(
+                    (m_exact.u[j, t].value or 0) > 0.5
+                    for j in m_exact.J for t in m_exact.T
+                )
+            else:
+                exact_has_feasible = False
         except Exception:
             exact_has_feasible = False
 
