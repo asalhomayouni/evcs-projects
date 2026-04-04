@@ -428,23 +428,60 @@ def run_single_experiment():
         trace.to_csv(trace_path, index=False)
         print(f"Trace saved -> {trace_path}")
 
-    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    trace = pd.read_csv(r"C:\Users\asus\OneDrive\EV-projects\evcs-projects\results\trace_center_146_Verona_k250_seed11.csv")
-    exact_obj = 402.49  # from your run output
+    trace = dr_out.get("DR_trace")
 
-    plt.figure(figsize=(9,5))
-    plt.plot(trace["iteration"], trace["current"], alpha=0.4, label="DR fluctuating")
-    plt.plot(trace["iteration"], trace["best_full"], linewidth=2, label="DR best-so-far")
-    plt.axhline(y=exact_obj, linestyle="--", linewidth=2, label=f"Exact ({exact_obj:.3f})")
-    plt.xlabel("iteration")
-    plt.ylabel("Score")
-    plt.title("DR vs Exact | Verona N=250, T=6, seed=11")
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(r"C:\Users\asus\OneDrive\EV-projects\evcs-projects\results\dr_curve_verona.png", dpi=300)
-    plt.show()`
+    bench_dir = PROJECT_ROOT / "results" / "benchmarking"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = Path(CSV_NAME).stem
+
+    if trace is not None and len(trace) > 0:
+
+        # ---- save trace CSV ----
+        trace_path = bench_dir / f"trace_{stem}_seed{seed}_T{T}_D{D}.csv"
+        trace.to_csv(trace_path, index=False)
+        print(f"📄 Trace saved → {trace_path}")
+
+        # ---- generate and save plot ----
+        x = trace["iteration"].to_numpy()
+
+        if "current" in trace.columns:
+            current = trace["current"].to_numpy()
+        else:
+            current = trace["proxy_curr"].to_numpy()
+
+        if "best_full" in trace.columns:
+            best = trace["best_full"].ffill().to_numpy()
+        else:
+            best = trace["best"].ffill().to_numpy()
+
+        plt.figure(figsize=(9, 5))
+        plt.plot(x, current, alpha=0.4, linewidth=1.0, label="DR fluctuating (current)")
+        plt.plot(x, best, linewidth=2.5, label="DR best-so-far (best_full)")
+        plt.axhline(
+            y=exact_obj,
+            linestyle="--",
+            linewidth=2.0,
+            label=f"Exact ({exact_obj:.3f})"
+        )
+        plt.xlabel("Iteration")
+        plt.ylabel("Score")
+        plt.title(f"DR vs Exact | {stem} | T={T} D={D} seed={seed}")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+
+        plot_path = bench_dir / f"dr_curve_{stem}_seed{seed}_T{T}_D{D}.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"📈 Plot saved → {plot_path}")
+
+    else:
+        print("⚠️ No trace data — plot skipped")
 # =========================
 # ENTRY
 # =========================
