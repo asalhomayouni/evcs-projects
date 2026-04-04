@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 parser = argparse.ArgumentParser()
 parser.add_argument("--csv",  type=str,   default="center_146_Verona_k250.csv")
 parser.add_argument("--seed", type=int,   default=11)
-parser.add_argument("--D",    type=float, default=0.5)
+parser.add_argument("--D",    type=float, default=2.0)
 parser.add_argument("--T",    type=int,   default=6)
 parser.add_argument("--Q",    type=float, default=20.0)
 args = parser.parse_args()
@@ -400,7 +400,7 @@ def run_single_experiment():
             df_all = pd.concat([df_old, df_new], ignore_index=True)
 
         except Exception as e:
-            print(f"⚠️ Could not read existing Excel, creating new: {e}")
+            print(f"WARNING: Could not read existing Excel, creating new: {e}")
             df_all = df_new
     else:
         df_all = df_new
@@ -409,7 +409,7 @@ def run_single_experiment():
     try:
         with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
             df_all.to_excel(writer, sheet_name="benchmark", index=False)
-        print(f"📊 Excel updated → {excel_file}")
+        print(f"Excel updated -> {excel_file}")
         print(f"   Total rows: {len(df_all)}")
     except PermissionError:
         # file is open in Excel — save with timestamp
@@ -417,18 +417,16 @@ def run_single_experiment():
         alt = excel_file.with_name(f"benchmark_with_SLURM_LOCKED_{stamp}.xlsx")
         with pd.ExcelWriter(alt, engine="openpyxl", mode="w") as writer:
             df_all.to_excel(writer, sheet_name="benchmark", index=False)
-        print(f"⚠️ File was open — saved as: {alt}")
+        print(f"WARNING: File was open -- saved as: {alt}")
 
     # -------------------------
     # SAVE TRACE CSV for local plotting
-    # (supervisor: generate plots on your machine, not server)
     # -------------------------
     trace = dr_out.get("DR_trace")
     if trace is not None and len(trace) > 0:
         trace_path = RESULTS_DIR / f"trace_{Path(CSV_NAME).stem}_seed{seed}.csv"
         trace.to_csv(trace_path, index=False)
-        print(f"📈 Trace saved → {trace_path}")
-        print("   (generate plot locally from this CSV)")
+        print(f"Trace saved -> {trace_path}")
 
 
 # =========================
