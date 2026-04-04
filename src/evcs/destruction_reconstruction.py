@@ -1360,9 +1360,15 @@ def run_DR_multi(
         demand_TM = demand_TM.T
 
     # -------------------------
-    # Arcs
+    # Arcs — reuse from inst if available so forbid_self matches exactly
     # -------------------------
-    distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D)
+    if "in_range" in inst and "distIJ" in inst and "Ji" in inst and "Ij" in inst:
+        distIJ  = inst["distIJ"]
+        in_range = inst["in_range"]
+        Ji      = inst["Ji"]
+        Ij      = inst["Ij"]
+    else:
+        distIJ, in_range, Ji, Ij = build_arcs(coords_I, coords_J, D=D)
 
     Ij_int = {j: [] for j in range(N)}
     Ji_int = {i: [] for i in range(M)}
