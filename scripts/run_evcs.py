@@ -295,24 +295,26 @@ def run_single_experiment():
     # -------------------------
     t_global_end = time.time()
 
-    if exact_obj is not None and exact_obj > 1e-9:
-        gap_abs = exact_obj - dr_best
-        gap_pct = 100 * gap_abs / exact_obj
+    # Gap = (Exact_incumbent_raw - DR_best) / Exact_incumbent_raw
+    # This is the only reported gap: DR vs the MIP's true joint-optimal objective
+    if exact_inc_raw is not None and exact_inc_raw > 1e-9:
+        gap_abs = exact_inc_raw - dr_best
+        gap_pct = 100 * gap_abs / exact_inc_raw
     else:
         gap_abs = None
         gap_pct = None
 
     print("\n===== RESULTS =====")
-    print(f"Instance : {CSV_NAME}")
-    print(f"N, M, T  : {N}, {M}, {T}")
-    print(f"Policy   : {policy}")
-    print(f"seed     : {seed}")
-    print(f"DR best  : {dr_best:.4f}")
-    print(f"Exact    : {exact_obj:.4f}" if exact_obj is not None else "Exact    : N/A (no feasible solution)")
-    print(f"Gap      : {gap_abs:.4f} ({gap_pct:.2f}%)" if gap_pct is not None else "Gap      : N/A")
-    print(f"Time DR  : {t_dr_end - t_dr_start:.2f}s")
-    print(f"Time EX  : {t_exact_end - t_exact_start:.2f}s")
-    print(f"Time TOT : {t_global_end - t_global_start:.2f}s")
+    print(f"Instance         : {CSV_NAME}")
+    print(f"N, M, T          : {N}, {M}, {T}")
+    print(f"Policy           : {policy}")
+    print(f"seed             : {seed}")
+    print(f"DR best          : {dr_best:.4f}")
+    print(f"Exact incumbent  : {exact_inc_raw:.4f}" if exact_inc_raw is not None else "Exact incumbent  : N/A")
+    print(f"Gap              : {gap_abs:.4f} ({gap_pct:.4f}%)" if gap_pct is not None else "Gap              : N/A")
+    print(f"Time DR          : {t_dr_end - t_dr_start:.2f}s")
+    print(f"Time EX          : {t_exact_end - t_exact_start:.2f}s")
+    print(f"Time TOT         : {t_global_end - t_global_start:.2f}s")
     print("=====================\n")
 
     # EXCEL LOG — benchmark_with_SLURM.xlsx
@@ -348,7 +350,6 @@ def run_single_experiment():
         "total_demand":         round(float(demand_IT.sum()), 4),
 
         # exact
-        "Exact_aligned":        round(exact_obj, 4),
         "Exact_incumbent_raw":  exact_inc_raw,
         "Exact_bound_raw":      exact_bound_raw,
         "Exact_gap_raw":        exact_gap_raw,
@@ -366,13 +367,8 @@ def run_single_experiment():
         "frac_remove":          frac_remove,
         "accept_epsilon":       accept_epsilon,
 
-        # gaps
-        "Gap_abs":              round(exact_obj - dr_best, 4),
-        "Gap_%":                round(100 * (exact_obj - dr_best) / max(exact_obj, 1e-9), 4),
-
-        # raw gaps
-        "Gap_raw_inc":          round(exact_inc_raw - dr_best, 4) if exact_inc_raw is not None else None,
-        "Gap_raw_inc_%":        round(100 * (exact_inc_raw - dr_best) / max(abs(exact_inc_raw), 1e-9), 4) if exact_inc_raw is not None else None,
+        # gap: DR vs MIP true joint-optimal objective (the only reported gap)
+        "Gap_%":                round(gap_pct, 4) if gap_pct is not None else None,
 
         # timing
         "Total_time_s":         round(t_global_end - t_global_start, 2),
@@ -463,10 +459,10 @@ def run_single_experiment():
         plt.plot(x, current, alpha=0.4, linewidth=1.0, label="DR fluctuating (current)")
         plt.plot(x, best, linewidth=2.5, label="DR best-so-far (best_full)")
         plt.axhline(
-            y=exact_obj,
+            y=exact_inc_raw,
             linestyle="--",
             linewidth=2.0,
-            label=f"Exact ({exact_obj:.3f})"
+            label=f"Exact incumbent ({exact_inc_raw:.3f})"
         )
         plt.xlabel("Iteration")
         plt.ylabel("Score")
