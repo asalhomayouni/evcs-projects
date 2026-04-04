@@ -1531,12 +1531,14 @@ def run_DR_multi(
                 best_full_score = best_batch_score
                 U_best = dict(best_batch_U)
 
-        # ADD at bottom of the for-loop body:
+        proxy_scores = [p for p, _ in candidate_pool]
         trace_records.append({
-                "iteration": it,
-                "current": float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
-                "best_full": float(best_full_score),
-            })
+            "iteration":   it,
+            "proxy_max":   float(max(proxy_scores)) if proxy_scores else float(proxy_curr),
+            "proxy_min":   float(min(proxy_scores)) if proxy_scores else float(proxy_curr),
+            "proxy_mean":  float(sum(proxy_scores) / len(proxy_scores)) if proxy_scores else float(proxy_curr),
+            "best_full":   float(best_full_score),
+        })
 
     return {
         "U_best": U_best,

@@ -7,6 +7,7 @@ import pandas as pd
 import sys
 import numpy as np
 import argparse
+from datetime import datetime
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -53,8 +54,8 @@ policy                = "closest_priority"
 max_chargers_per_site = 6
 
 # DR parameters
-max_iter       = 2000     # high so time limit always triggers first
-dr_time_limit  = 3000      # 10 minutes
+max_iter       = 200     # high so time limit always triggers first
+dr_time_limit  = 300      # 10 minutes
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
@@ -65,7 +66,7 @@ adaptive_destroy = True
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver
-exact_time_limit = 600    # 5 minutes (enough for small instances)
+exact_time_limit = 3600    # 5 minutes (enough for small instances)
 mip_gap          = 0.001
 
 
@@ -144,27 +145,7 @@ def run_single_experiment():
     demand_IT = inst["demand_IT"]   # shape (T, M)
     P_T_local = [8] * T             # budget per period
 
-    # -------------------------
-    # DIAGNOSTICS — compare with notebook
-    # -------------------------
-    print("=== SCRIPT DIAGNOSTICS ===")
-    print(f"CSV              : {CSV_NAME}")
-    print(f"M (demand nodes) : {M}")
-    print(f"N (sites)        : {N}")
-    print(f"T (periods)      : {T}")
-    print(f"Arcs in_range    : {len(in_range)}")
-    print(f"Demand period 0  : {demand_IT[0].sum():.4f}")
-    print(f"Demand period 1  : {demand_IT[1].sum():.4f}")
-    print(f"Demand period 2  : {demand_IT[2].sum():.4f}")
-    print(f"Total demand     : {demand_IT.sum():.4f}")
-    print(f"Min demand node  : {demand_IT.min():.4f}")
-    print(f"Max demand node  : {demand_IT.max():.4f}")
-    print(f"D (km)           : {D}")
-    print(f"Q                : {Q}")
-    print(f"P_T              : {P_T_local}")
-    print(f"seed             : {seed}")
-    print(f"Total capacity   : {Q * sum(P_T_local):.1f}")
-    print("==========================")
+    print(f"Instance: {CSV_NAME}  N={N}  T={T}  D={D}  seed={seed}  |A|={len(in_range)}")
 
     # -------------------------
     # DR
@@ -196,16 +177,6 @@ def run_single_experiment():
     t_dr_end = time.time()
 
     dr_best = dr_out["best_obj"]
-    print(f"DR best = {dr_best:.4f}")
-
-    # DR debug info
-    U_best = dr_out["U_best"]
-    total_chargers = sum(U_best.values())
-    total_capacity = total_chargers * Q
-    print(f"  chargers installed : {total_chargers}")
-    print(f"  total capacity     : {total_capacity:.1f}")
-    print(f"  total demand       : {demand_IT.sum():.1f}")
-    print(f"  max coverable      : {min(total_capacity, demand_IT.sum()):.1f}")
 
     # -------------------------
     # EXACT
@@ -253,43 +224,6 @@ def run_single_experiment():
     # (same evaluation method as DR uses)
     # Only run if Gurobi actually found a feasible integer solution
     # -------------------------
-    exact_obj = None
-    exact_has_feasible = (
-        exact_inc_raw is not None
-        and any((model.u[j, t].value or 0) > 0.5 for j in model.J for t in model.T)
-    )
-
-    if exact_has_feasible:
-        U_exact = {
-            (j, t): int(round(model.u[j, t].value))
-            for j in model.J
-            for t in model.T
-        }
-
-        m_tmp = model.clone()
-        for (j, t), val in U_exact.items():
-            m_tmp.u[j, t].value = val
-
-        sync_solution_state(m_tmp, cumulative_install=True)
-        reassign_y_greedy_multi(
-            m_tmp, distIJ,
-            Ji=inst["Ji"],
-            method_name=policy,
-            cumulative_install=True,
-        )
-
-        exact_obj = 0.0
-        for t in m_tmp.T:
-            for i in m_tmp.I:
-                for j in inst["Ji"][i]:
-                    val = m_tmp.y[i, j, t].value
-                    if val is not None and val > 0.5:
-                        exact_obj += demand_IT[t, i]
-                        break
-        print(f"Exact obj = {exact_obj:.4f}")
-    else:
-        print("Exact: no feasible integer solution found within time limit.")
-
     # -------------------------
     # RESULTS
     # -------------------------
@@ -319,11 +253,6 @@ def run_single_experiment():
 
     # EXCEL LOG — benchmark_with_SLURM.xlsx
     # =========================
-    import pandas as pd
-    import numpy as np
-    from pathlib import Path
-    from datetime import datetime
-
     # ---- output path ----
     bench_dir  = PROJECT_ROOT / "results" / "benchmarking"
     bench_dir.mkdir(parents=True, exist_ok=True)
@@ -415,23 +344,7 @@ def run_single_experiment():
             df_all.to_excel(writer, sheet_name="benchmark", index=False)
         print(f"WARNING: File was open -- saved as: {alt}")
 
-    # -------------------------
-    # SAVE TRACE CSV for local plotting
-    # -------------------------
     trace = dr_out.get("DR_trace")
-    if trace is not None and len(trace) > 0:
-        trace_path = RESULTS_DIR / f"trace_{Path(CSV_NAME).stem}_seed{seed}.csv"
-        trace.to_csv(trace_path, index=False)
-        print(f"Trace saved -> {trace_path}")
-
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    trace = dr_out.get("DR_trace")
-
-    bench_dir = PROJECT_ROOT / "results" / "benchmarking"
-    bench_dir.mkdir(parents=True, exist_ok=True)
 
     stem = Path(CSV_NAME).stem
 
@@ -445,25 +358,26 @@ def run_single_experiment():
         # ---- generate and save plot ----
         x = trace["iteration"].to_numpy()
 
-        if "current" in trace.columns:
-            current = trace["current"].to_numpy()
-        else:
-            current = trace["proxy_curr"].to_numpy()
+        best = trace["best_full"].ffill().to_numpy()
 
-        if "best_full" in trace.columns:
-            best = trace["best_full"].ffill().to_numpy()
-        else:
-            best = trace["best"].ffill().to_numpy()
+        plt.figure(figsize=(10, 5))
 
-        plt.figure(figsize=(9, 5))
-        plt.plot(x, current, alpha=0.4, linewidth=1.0, label="DR fluctuating (current)")
-        plt.plot(x, best, linewidth=2.5, label="DR best-so-far (best_full)")
-        plt.axhline(
-            y=exact_inc_raw,
-            linestyle="--",
-            linewidth=2.0,
-            label=f"Exact incumbent ({exact_inc_raw:.3f})"
-        )
+        # proxy fluctuation band (min/max across batch candidates per iteration)
+        if "proxy_max" in trace.columns and "proxy_min" in trace.columns:
+            plt.fill_between(x, trace["proxy_min"].to_numpy(), trace["proxy_max"].to_numpy(),
+                             alpha=0.2, color="tab:blue", label="Proxy range (min-max per batch)")
+        if "proxy_mean" in trace.columns:
+            plt.plot(x, trace["proxy_mean"].to_numpy(),
+                     alpha=0.6, linewidth=1.0, linestyle="--", color="tab:blue", label="Proxy mean")
+
+        # DR best-so-far (full eval)
+        plt.plot(x, best, linewidth=2.5, color="tab:orange", label="DR best-so-far (full eval)")
+
+        # exact line
+        if exact_inc_raw is not None:
+            plt.axhline(y=exact_inc_raw, linestyle="--", linewidth=2.0, color="tab:green",
+                        label=f"Exact incumbent ({exact_inc_raw:.3f})")
+
         plt.xlabel("Iteration")
         plt.ylabel("Score")
         plt.title(f"DR vs Exact | {stem} | T={T} D={D} seed={seed}")
@@ -474,10 +388,10 @@ def run_single_experiment():
         plot_path = bench_dir / f"dr_curve_{stem}_seed{seed}_T{T}_D{D}.png"
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"📈 Plot saved → {plot_path}")
+        print(f"Plot saved -> {plot_path}")
 
     else:
-        print("⚠️ No trace data — plot skipped")
+        print("No trace data — plot skipped")
 # =========================
 # ENTRY
 # =========================
