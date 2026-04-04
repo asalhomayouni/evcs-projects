@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 parser = argparse.ArgumentParser()
 parser.add_argument("--csv",  type=str,   default="center_146_Verona_k250.csv")
 parser.add_argument("--seed", type=int,   default=11)
-parser.add_argument("--D",    type=float, default=2.0)
+parser.add_argument("--D",    type=float, default=0.5)
 parser.add_argument("--T",    type=int,   default=6)
 parser.add_argument("--Q",    type=float, default=20.0)
 args = parser.parse_args()
