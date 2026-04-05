@@ -26,6 +26,11 @@ echo "Node      : $SLURMD_NODENAME"
 echo "Start     : $(date)"
 
 cd ~/EVCS-PROJECTS
-python scripts/run_evcs.py
+python scripts/run_evcs.py \
+    --csv  ${CSV:-center_146_Verona_k250.csv} \
+    --seed ${SEED:-11} \
+    --D    ${D_KM:-2.0} \
+    --T    ${T_VAL:-6} \
+    --Q    ${Q_VAL:-20}
 
 echo "End : $(date)"
