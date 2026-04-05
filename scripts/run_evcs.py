@@ -21,10 +21,6 @@ from evcs import (
 
 from evcs.methods import sync_solution_state, reassign_y_greedy_multi
 from evcs.geom import build_arcs
-import matplotlib
-matplotlib.use("Agg")   # required on Narval (no display)
-import matplotlib.pyplot as plt
-
 
 # =========================
 # ARGUMENTS
@@ -54,8 +50,8 @@ policy                = "closest_priority"
 max_chargers_per_site = 6
 
 # DR parameters
-max_iter       = 200     # high so time limit always triggers first
-dr_time_limit  = 300      # 10 minutes
+max_iter       = 2000     # high so time limit always triggers first
+dr_time_limit  = 1000     # 10 minutes
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
@@ -345,53 +341,14 @@ def run_single_experiment():
         print(f"WARNING: File was open -- saved as: {alt}")
 
     trace = dr_out.get("DR_trace")
-
-    stem = Path(CSV_NAME).stem
+    stem  = Path(CSV_NAME).stem
 
     if trace is not None and len(trace) > 0:
-
-        # ---- save trace CSV ----
         trace_path = bench_dir / f"trace_{stem}_seed{seed}_T{T}_D{D}.csv"
         trace.to_csv(trace_path, index=False)
-        print(f"📄 Trace saved → {trace_path}")
-
-        # ---- generate and save plot ----
-        x = trace["iteration"].to_numpy()
-
-        best = trace["best_full"].ffill().to_numpy()
-
-        plt.figure(figsize=(10, 5))
-
-        # proxy fluctuation band (min/max across batch candidates per iteration)
-        if "proxy_max" in trace.columns and "proxy_min" in trace.columns:
-            plt.fill_between(x, trace["proxy_min"].to_numpy(), trace["proxy_max"].to_numpy(),
-                             alpha=0.2, color="tab:blue", label="Proxy range (min-max per batch)")
-        if "proxy_mean" in trace.columns:
-            plt.plot(x, trace["proxy_mean"].to_numpy(),
-                     alpha=0.6, linewidth=1.0, linestyle="--", color="tab:blue", label="Proxy mean")
-
-        # DR best-so-far (full eval)
-        plt.plot(x, best, linewidth=2.5, color="tab:orange", label="DR best-so-far (full eval)")
-
-        # exact line
-        if exact_inc_raw is not None:
-            plt.axhline(y=exact_inc_raw, linestyle="--", linewidth=2.0, color="tab:green",
-                        label=f"Exact incumbent ({exact_inc_raw:.3f})")
-
-        plt.xlabel("Iteration")
-        plt.ylabel("Score")
-        plt.title(f"DR vs Exact | {stem} | T={T} D={D} seed={seed}")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-
-        plot_path = bench_dir / f"dr_curve_{stem}_seed{seed}_T{T}_D{D}.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"Plot saved -> {plot_path}")
-
+        print(f"Trace saved -> {trace_path}")
     else:
-        print("No trace data — plot skipped")
+        print("No trace data.")
 # =========================
 # ENTRY
 # =========================
