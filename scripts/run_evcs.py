@@ -302,9 +302,18 @@ def run_single_experiment():
     df_new = pd.DataFrame([row])
 
     # ---- append to existing or create new ----
+    df_old_sheets = {}   # will hold existing trace sheets to preserve them
     if excel_file.exists():
         try:
-            df_old = pd.read_excel(excel_file)
+            df_old = pd.read_excel(excel_file, sheet_name="benchmark")
+
+            # preserve existing trace sheets
+            from openpyxl import load_workbook
+            wb = load_workbook(excel_file, read_only=True, data_only=True)
+            for sname in wb.sheetnames:
+                if sname != "benchmark":
+                    df_old_sheets[sname] = pd.read_excel(excel_file, sheet_name=sname)
+            wb.close()
 
             # add any new columns that did not exist before
             for col in df_new.columns:
@@ -326,29 +335,37 @@ def run_single_experiment():
     else:
         df_all = df_new
 
+    # ---- assign trace sheet name for this row ----
+    trace     = dr_out.get("DR_trace")
+    has_trace = trace is not None and len(trace) > 0
+    trace_sheet_name = f"t{len(df_all) - 1}" if has_trace else None
+    if trace_sheet_name:
+        df_all.loc[len(df_all) - 1, "Trace_sheet"] = trace_sheet_name
+
     # ---- save ----
-    try:
-        with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
+    def _write_excel(path):
+        with pd.ExcelWriter(path, engine="openpyxl", mode="w") as writer:
             df_all.to_excel(writer, sheet_name="benchmark", index=False)
+            # write preserved trace sheets
+            for sname, sdf in df_old_sheets.items():
+                sdf.to_excel(writer, sheet_name=sname, index=False)
+            # write new trace sheet
+            if has_trace:
+                trace.to_excel(writer, sheet_name=trace_sheet_name, index=False)
+
+    try:
+        _write_excel(excel_file)
         print(f"Excel updated -> {excel_file}")
         print(f"   Total rows: {len(df_all)}")
+        if has_trace:
+            print(f"   Trace sheet: {trace_sheet_name}  ({len(trace)} iterations)")
+        else:
+            print("   No trace data.")
     except PermissionError:
-        # file is open in Excel — save with timestamp
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         alt = excel_file.with_name(f"benchmark_with_SLURM_LOCKED_{stamp}.xlsx")
-        with pd.ExcelWriter(alt, engine="openpyxl", mode="w") as writer:
-            df_all.to_excel(writer, sheet_name="benchmark", index=False)
+        _write_excel(alt)
         print(f"WARNING: File was open -- saved as: {alt}")
-
-    trace = dr_out.get("DR_trace")
-    stem  = Path(CSV_NAME).stem
-
-    if trace is not None and len(trace) > 0:
-        trace_path = bench_dir / f"trace_{stem}_seed{seed}_T{T}_D{D}.csv"
-        trace.to_csv(trace_path, index=False)
-        print(f"Trace saved -> {trace_path}")
-    else:
-        print("No trace data.")
 # =========================
 # ENTRY
 # =========================
