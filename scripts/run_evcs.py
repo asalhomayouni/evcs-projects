@@ -50,8 +50,8 @@ policy                = "closest_priority"
 max_chargers_per_site = 6
 
 # DR parameters
-max_iter       = 2000     # high so time limit always triggers first
-dr_time_limit  = 1000     # 10 minutes
+max_iter       = 2000     
+dr_time_limit  = 1000     
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
@@ -62,7 +62,7 @@ adaptive_destroy = True
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver
-exact_time_limit = 3600    # 5 minutes (enough for small instances)
+exact_time_limit = 3600    
 mip_gap          = 0.001
 
 
