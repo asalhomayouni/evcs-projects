@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=evcs_array
 #SBATCH --account=def-tms
-#SBATCH --cpus-per-task=2
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=16G
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --array=1-10
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err

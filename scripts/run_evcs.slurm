@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=evcs_run
 #SBATCH --account=def-tms
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=16G
 #SBATCH --output=logs/evcs_%j.out

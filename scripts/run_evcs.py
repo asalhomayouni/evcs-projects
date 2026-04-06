@@ -51,18 +51,18 @@ max_chargers_per_site = 6
 
 # DR parameters
 max_iter       = 2000     
-dr_time_limit  = 1000     
+dr_time_limit  = 1200     
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
 ls_frac_remove = 0.08
 frac_remove    = 0.3
-accept_epsilon = 1e-6
+accept_epsilon = 0.0001
 adaptive_destroy = True
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver
-exact_time_limit = 3600    
+exact_time_limit = 7200    
 mip_gap          = 0.001
 
 
