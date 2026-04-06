@@ -1426,7 +1426,8 @@ def run_DR_multi(
     # =========================
     # MAIN LOOP (LEFT FLOWCHART)
     # =========================
-    trace_records = [] 
+    trace_records = []
+    eval_id = 0
     for it in range(max_iter):
 
         if time.perf_counter() - t_start > dr_time_limit:
@@ -1468,6 +1469,14 @@ def run_DR_multi(
             )
 
             candidate_pool.append((proxy, U_recon))
+            trace_records.append({
+                "eval_id":   eval_id,
+                "iteration": it,
+                "phase":     "dr",
+                "proxy":     float(proxy),
+                "best_full": float(best_full_score),
+            })
+            eval_id += 1
 
         if not candidate_pool:
             continue
@@ -1531,14 +1540,15 @@ def run_DR_multi(
                 best_full_score = best_batch_score
                 U_best = dict(best_batch_U)
 
-        proxy_scores = [p for p, _ in candidate_pool]
+        # record one checkpoint per iteration with updated best_full
         trace_records.append({
-            "iteration":   it,
-            "proxy_max":   float(max(proxy_scores)) if proxy_scores else float(proxy_curr),
-            "proxy_min":   float(min(proxy_scores)) if proxy_scores else float(proxy_curr),
-            "proxy_mean":  float(sum(proxy_scores) / len(proxy_scores)) if proxy_scores else float(proxy_curr),
-            "best_full":   float(best_full_score),
+            "eval_id":   eval_id,
+            "iteration": it,
+            "phase":     "checkpoint",
+            "proxy":     float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
+            "best_full": float(best_full_score),
         })
+        eval_id += 1
 
     return {
         "U_best": U_best,
