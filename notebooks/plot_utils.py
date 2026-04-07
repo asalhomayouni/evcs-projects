@@ -69,11 +69,7 @@ def plot_dr_curve(ax, trace, row, sheet_name):
     ax.plot(x_iter, best_arr, linewidth=2.5, color="tab:orange",
             label="DR best-so-far (best_full)")
 
-    # ── y-axis limits ────────────────────────────────────────────────────────
-    pad = (y_hi - y_lo) * 0.05 if y_hi > y_lo else 1.0
-    ax.set_ylim(y_lo - pad, y_hi + pad)
-
-    # ── metadata & title ─────────────────────────────────────────────────────
+    # ── metadata, exact line & title ─────────────────────────────────────────
     if row is not None:
         instance = row["Instance"]
         N        = int(row["N"])
@@ -84,6 +80,7 @@ def plot_dr_curve(ax, trace, row, sheet_name):
         gap      = row["Gap_%"]
 
         if pd.notna(exact):
+            y_hi = max(y_hi, float(exact))  # ensure exact line is within ylim
             ax.axhline(y=float(exact), linestyle="--", linewidth=2.0,
                        color="tab:red", label=f"Exact ({float(exact):.3f})")
 
@@ -94,6 +91,10 @@ def plot_dr_curve(ax, trace, row, sheet_name):
         )
     else:
         title = f"Sheet {sheet_name}  (no benchmark metadata)\n{iters_label}"
+
+    # ── y-axis limits ────────────────────────────────────────────────────────
+    pad = (y_hi - y_lo) * 0.05 if y_hi > y_lo else 1.0
+    ax.set_ylim(y_lo - pad, y_hi + pad)
 
     ax.set_title(title, fontsize=9)
     ax.set_xlabel("iteration", fontsize=9)
