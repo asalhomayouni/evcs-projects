@@ -52,8 +52,8 @@ policy                = "closest_priority"
 max_chargers_per_site = 6
 
 # DR parameters
-max_iter       = 2000     
-dr_time_limit  = 1200     
+max_iter       = 5000    
+dr_time_limit  = 2000    
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
@@ -64,7 +64,7 @@ adaptive_destroy = True
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver
-exact_time_limit = 7200    
+exact_time_limit = 10000    
 mip_gap          = 0.001
 
 
