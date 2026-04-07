@@ -26,11 +26,13 @@ from evcs.geom import build_arcs
 # ARGUMENTS
 # =========================
 parser = argparse.ArgumentParser()
-parser.add_argument("--csv",  type=str,   default="center_146_Verona_k250.csv")
-parser.add_argument("--seed", type=int,   default=11)
-parser.add_argument("--D",    type=float, default=2.0)
-parser.add_argument("--T",    type=int,   default=6)
-parser.add_argument("--Q",    type=float, default=20.0)
+parser.add_argument("--csv",         type=str,   default="center_146_Verona_k250.csv")
+parser.add_argument("--seed",        type=int,   default=11)
+parser.add_argument("--D",           type=float, default=2.0)
+parser.add_argument("--T",           type=int,   default=6)
+parser.add_argument("--Q",           type=float, default=20.0)
+parser.add_argument("--reset-excel", action="store_true",
+                    help="Clear benchmark_with_SLURM.xlsx before running (fresh start for new array job)")
 args = parser.parse_args()
 
 # =========================
@@ -119,6 +121,24 @@ def build_instance_from_csv(csv_path, T, seed, D_km):
 # =========================
 # MAIN
 # =========================
+BENCHMARK_COLUMNS = [
+    "Timestamp", "Instance", "Policy", "N", "M", "T", "seed", "D_km", "Q",
+    "P_T", "max_chargers_per_site", "|A|", "arc_density", "total_demand",
+    "Exact_incumbent_raw", "Exact_bound_raw", "Exact_gap_raw", "Exact_time_s",
+    "DR_best", "DR_iters", "DR_time_s", "DR_time_limit_s",
+    "batch_size", "top_k_full", "ls_moves", "max_iter", "frac_remove", "accept_epsilon",
+    "Gap_%", "Total_time_s", "Trace_sheet",
+]
+
+
+def reset_excel(excel_file):
+    """Wipe benchmark_with_SLURM.xlsx to an empty benchmark sheet."""
+    df_empty = pd.DataFrame(columns=BENCHMARK_COLUMNS)
+    with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
+        df_empty.to_excel(writer, sheet_name="benchmark", index=False)
+    print(f"Excel reset: {excel_file}")
+
+
 def run_single_experiment():
     global T, seed
 
@@ -282,7 +302,7 @@ def run_single_experiment():
 
         # DR
         "DR_best":              round(dr_best, 4),
-        "DR_iters":             len(dr_out.get("DR_trace", [])),
+        "DR_iters":             int((dr_out["DR_trace"]["phase"] == "checkpoint").sum()) if dr_out.get("DR_trace") is not None and "phase" in dr_out["DR_trace"].columns else len(dr_out.get("DR_trace", [])),
         "DR_time_s":            round(t_dr_end - t_dr_start, 2),
         "DR_time_limit_s":      dr_time_limit,
         "batch_size":           batch_size,
@@ -370,4 +390,8 @@ def run_single_experiment():
 # ENTRY
 # =========================
 if __name__ == "__main__":
+    if args.reset_excel:
+        bench_dir  = PROJECT_ROOT / "results" / "benchmarking"
+        bench_dir.mkdir(parents=True, exist_ok=True)
+        reset_excel(bench_dir / "benchmark_with_SLURM.xlsx")
     run_single_experiment()

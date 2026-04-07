@@ -1469,6 +1469,8 @@ def run_DR_multi(
             )
 
             candidate_pool.append((proxy, U_recon))
+
+            # log individual proxy evaluation for trace visualisation
             trace_records.append({
                 "eval_id":   eval_id,
                 "iteration": it,
@@ -1484,7 +1486,7 @@ def run_DR_multi(
         # -------------------------
         # 2) Rank by proxy
         # -------------------------
-        candidate_pool.sort(reverse=True, key=lambda x: x[0])
+        candidate_pool.sort(reverse=True, key=lambda x: x[0])\
 
         # -------------------------
         # 3) Top-k selection
