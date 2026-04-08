@@ -79,12 +79,18 @@ def plot_dr_curve(ax, trace, row, sheet_name):
         exact    = row["Exact_incumbent_raw"]
         gap      = row["Gap_%"]
 
-        if pd.notna(exact):
+        # Only draw the exact line when Gurobi actually found an incumbent
+        exact_valid = pd.notna(exact) and float(exact) > 0.0
+        if exact_valid:
             y_hi = max(y_hi, float(exact))  # ensure exact line is within ylim
             ax.axhline(y=float(exact), linestyle="--", linewidth=2.0,
                        color="tab:red", label=f"Exact ({float(exact):.3f})")
 
-        gap_str = f"{gap:.4f}%" if pd.notna(gap) else "N/A"
+        if exact_valid and pd.notna(gap):
+            gap_str = f"{gap:.4f}%"
+        else:
+            gap_str = "No incumbent"
+
         title = (
             f"DR vs Exact  |  N={N}, T={T}, seed={seed}  |  policy={policy}\n"
             f"{instance}  -  Gap={gap_str},  DR={best_arr[-1]:.3f},  {iters_label}"
@@ -93,6 +99,13 @@ def plot_dr_curve(ax, trace, row, sheet_name):
         title = f"Sheet {sheet_name}  (no benchmark metadata)\n{iters_label}"
 
     # ── y-axis limits ────────────────────────────────────────────────────────
+    # Clip y_lo so that outlier proxy scores don't compress the interesting region.
+    # Floor = DR best-so-far minus 10 % of its value (generous margin below the
+    # orange line), so the axis never stretches absurdly for bad proxy outliers.
+    dr_best_final = float(best_arr[-1])
+    y_lo_floor = dr_best_final * 0.90
+    y_lo = max(y_lo, y_lo_floor)
+
     pad = (y_hi - y_lo) * 0.05 if y_hi > y_lo else 1.0
     ax.set_ylim(y_lo - pad, y_hi + pad)
 
