@@ -11,5 +11,5 @@ from .methods import (
     evaluate_u_full_policy_objective_multi
 )
 
-from .destruction_reconstruction import run_DR_multi
+from .dr import run_DR_multi, run_one_policy_multi, DRLogger
 from .instance import generate_instance, load_instance_npz
