@@ -33,6 +33,10 @@ parser.add_argument("--T",           type=int,   default=6)
 parser.add_argument("--Q",           type=float, default=20.0)
 parser.add_argument("--reset-excel", action="store_true",
                     help="Clear benchmark_with_SLURM.xlsx before running (fresh start for new array job)")
+parser.add_argument("--proxy-gate",  type=float, default=0.0,
+                    help="proxy_threshold_frac for ALNS gate (0=disabled, e.g. 0.92)")
+parser.add_argument("--label",       type=str,   default="",
+                    help="Short tag written to Excel to distinguish runs (e.g. 'alns_gate_0.92')")
 args = parser.parse_args()
 
 # =========================
@@ -61,6 +65,7 @@ ls_frac_remove = 0.08
 frac_remove    = 0.3
 accept_epsilon = 0.0001
 adaptive_destroy = True
+proxy_gate     = args.proxy_gate
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver

@@ -3,6 +3,14 @@ import random
 from typing import Optional
 import numpy as np
 
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+    from evcs.model_grb import _get_env
+    _GRB_AVAILABLE = True
+except ImportError:
+    _GRB_AVAILABLE = False
+
 
 # --- helpers ---
 def _dij(distIJ, i: int, j: int) -> float:
@@ -114,3 +122,122 @@ def full_eval_from_U_grb(U_dict, Q, inst, distIJ, policy, demand_TM=None, cumula
     cov = covered_by_period_pure(y_ijt, demand_arr, arcs, M, T)
 
     return float(np.sum(cov)), y_ijt, cov
+
+
+class GRBEvaluator:
+    """Gurobi y-assignment model built once and reused across DR iterations.
+
+    Given a fixed placement U_dict (which determines x[j,t]), solves for the
+    optimal demand-coverage assignment y.  One license checkout for the whole
+    DR run; dispose() is called once at the end.
+
+    Usage::
+        with GRBEvaluator(M, N, T, arcs, demand_TM, Q) as ev:
+            score0, _ = ev.evaluate(U_init)
+            for it in range(max_iter):
+                score, cov = ev.evaluate(U_candidate)
+        # dispose() called automatically on __exit__
+    """
+
+    def __init__(self, M, N, T, arcs, demand_TM, Q, cumulative_install=True):
+        if not _GRB_AVAILABLE:
+            raise ImportError("gurobipy is required for GRBEvaluator")
+
+        self.M = M
+        self.N = N
+        self.T = T
+        self.Q = float(Q)
+        self.cumulative_install = cumulative_install
+        self._arcs = list(arcs)
+
+        d = np.asarray(demand_TM, dtype=float)  # (T, M)
+        self._a = {(i, t): float(d[t, i]) for i in range(M) for t in range(T)}
+
+        # precompute arc lookups used in evaluate()
+        arcs_by_i = {i: [] for i in range(M)}
+        arcs_by_j = {j: [] for j in range(N)}
+        for (i, j) in self._arcs:
+            arcs_by_i[i].append(j)
+            arcs_by_j[j].append(i)
+        self._arcs_by_i = arcs_by_i
+
+        # --- build the model once (one license checkout) ---
+        gm = gp.Model(env=_get_env())
+        gm.setParam("OutputFlag", 0)
+
+        arc_t_keys = [(i, j, t) for (i, j) in self._arcs for t in range(T)]
+        y = gm.addVars(arc_t_keys, vtype=GRB.BINARY, name="y")
+        gm.update()
+
+        # objective: maximise covered demand
+        gm.setObjective(
+            gp.quicksum(self._a[i, t] * y[i, j, t] for (i, j, t) in arc_t_keys),
+            GRB.MAXIMIZE,
+        )
+
+        # each demand node served by at most one site per period
+        for i in range(M):
+            js = arcs_by_i[i]
+            if not js:
+                continue
+            for t in range(T):
+                gm.addConstr(gp.quicksum(y[i, j, t] for j in js) <= 1)
+
+        # capacity constraints — RHS updated via c.RHS each evaluate() call
+        cap_constrs = {}
+        for j in range(N):
+            i_list = arcs_by_j[j]
+            if not i_list:
+                continue
+            for t in range(T):
+                c = gm.addConstr(
+                    gp.quicksum(self._a[i, t] * y[i, j, t] for i in i_list) <= 0.0
+                )
+                cap_constrs[j, t] = c
+
+        gm.update()
+
+        self._gm = gm
+        self._y = y
+        self._cap_constrs = cap_constrs
+
+    def evaluate(self, U_dict):
+        """Fix placement U_dict, re-optimize y, return (total_score, cov_per_period).
+
+        Only bound updates + RHS changes happen — the model structure is
+        never rebuilt.  Gurobi warm-starts from the previous solution.
+        """
+        x_jt = _sync_x_from_u(U_dict, self.N, self.T, self.cumulative_install)
+
+        # fix y upper bounds: 0 if site j is closed at t, 1 if open
+        for (i, j) in self._arcs:
+            for t in range(self.T):
+                self._y[i, j, t].UB = 1.0 if x_jt.get((j, t), 0) > 0 else 0.0
+
+        # update capacity RHS: Q * x[j,t]
+        for (j, t), c in self._cap_constrs.items():
+            c.RHS = self.Q * float(x_jt.get((j, t), 0))
+
+        self._gm.update()
+        self._gm.optimize()
+
+        cov = np.zeros(self.T, dtype=float)
+        if self._gm.SolCount > 0:
+            for t in range(self.T):
+                for i in range(self.M):
+                    for j in self._arcs_by_i.get(i, []):
+                        if self._y[i, j, t].X > 0.5:
+                            cov[t] += self._a[i, t]
+                            break
+
+        return float(np.sum(cov)), cov
+
+    def dispose(self):
+        """Release the Gurobi model — one license return for the whole DR run."""
+        self._gm.dispose()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.dispose()

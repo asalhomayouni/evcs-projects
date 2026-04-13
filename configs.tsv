@@ -1,12 +1,10 @@
-center_87_Milano_k3375.csv	11	2.0	6	20
-center_87_Milano_k3375.csv	12	2.0	6	20
-center_547_Napoli_k3525.csv	11	2.0	6	20
-center_547_Napoli_k3525.csv	12	2.0	6	20
-center_207_Torino_k1950.csv	11	2.0	6	20
-center_207_Torino_k1950.csv	12	2.0	6	20
-center_276_Genova_k825.csv	11	2.0	6	20
-center_276_Genova_k825.csv	12	2.0	6	20
-center_710_Palermo_k1025.csv	11	2.0	6	20
-center_710_Palermo_k1025.csv	12	2.0	6	20
-center_751_Catania_k475.csv	11	2.0	6	20
-center_751_Catania_k475.csv	12	2.0	6	20
+0	center_102_Vicenza_k125.csv	11	2.0	6	20
+1   center_247_Reggio_Emilia_k125.csv	11	2.0	6	20
+2   center_153_Padova_k175.csv	11	2.0	6	20
+3   center_240_Parma_k200.csv	11	2.0	6	20
+4   center_323_Prato_k200.csv	11	2.0	6	20
+5   center_146_Verona_k250.csv	11	2.0	6	20
+6   center_58_Trieste_k225.csv	11	2.0	6	20
+7   center_79_Monza_k400.csv	11	2.0	6	20
+8   center_520_Bari_k400.csv	11	2.0	6	20
+

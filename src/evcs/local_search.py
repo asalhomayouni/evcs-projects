@@ -19,12 +19,19 @@ def local_search_u_proxy(
     ls_moves,
     ls_frac_remove,
     ls_modes,
-    Ij_int=None,              # 🔥 ADD
-    top_k_choice=3            # 🔥 ADD
+    Ij_int=None,
+    top_k_choice=3,
+    collect_visited: bool = False,
 ):
-    """
-    Proxy-guided local search on U-dict only.
-    This is separate from DR destroy/reconstruct.
+    """Proxy-guided local search on U-dict.
+
+    Parameters
+    ----------
+    collect_visited : bool
+        When True return ``(visited, proxy_best)`` where *visited* is the list
+        of every candidate U generated during the search (used for batch full
+        evaluation in the ALNS loop).  When False (default) return
+        ``(U_best, proxy_best)`` — unchanged from the original behaviour.
     """
     U_best = dict(U_start)
 
@@ -37,8 +44,9 @@ def local_search_u_proxy(
         T=int(T),
         N=int(N),
         cumulative_install=cumulative_install,
-
     ))
+
+    visited = [dict(U_start)] if collect_visited else None
 
     for _ in range(int(ls_moves)):
         mode = str(rng.choice(list(ls_modes)))
@@ -76,11 +84,15 @@ def local_search_u_proxy(
             T=int(T),
             N=int(N),
             cumulative_install=cumulative_install,
-
         ))
+
+        if collect_visited:
+            visited.append(dict(U_fill))
 
         if proxy_try > proxy_best + 1e-9:
             U_best = dict(U_fill)
             proxy_best = float(proxy_try)
 
+    if collect_visited:
+        return visited, float(proxy_best)
     return U_best, float(proxy_best)

@@ -20,6 +20,7 @@ from evcs.destroy import destroy_multi_u
 from evcs.greedy import reconstruct_u_dict_fast
 from evcs.local_search import local_search_u_proxy
 from evcs.full_eval import full_eval_from_U
+from evcs.full_eval_grb import GRBEvaluator
 
 
 class DRLogger:
@@ -377,12 +378,19 @@ def run_DR_multi(
 
     top_k_choice: int = 3,
 
-    # NEW algorithm controls
+    # kept for call-site compatibility; no longer used by the ALNS loop
     batch_size: int = 50,
     top_k_full: int = 5,
+
     ls_moves: int = 8,
     ls_frac_remove: float = 0.08,
     ls_modes=("site_swap", "local_remove"),
+    use_grb_eval: bool = False,
+
+    # ALNS proxy gate (replaces batch + top-K pipeline)
+    proxy_threshold_frac: float = 0.0,  # ε = frac × initial proxy; 0.0 = gate disabled
+    adaptive_patience: int = 20,         # consecutive rejects before lowering ε
+    threshold_decay: float = 0.97,       # ε multiplied by this on patience exhaustion
 ):
 
     rng = np.random.default_rng(seed if seed is not None else 0)
@@ -433,6 +441,13 @@ def run_DR_multi(
 
     Q_cap = float(m_template.Q.value)
 
+    # One Gurobi model built here, reused for every full evaluation in the loop.
+    # dispose() is called once at the end — one license checkout per DR run.
+    grb_eval = (
+        GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install)
+        if use_grb_eval else None
+    )
+
     # -------------------------
     # Initial solution
     # -------------------------
@@ -445,151 +460,154 @@ def run_DR_multi(
         Q_cap, T, N, cumulative_install
     )
 
-    full0 = full_eval_from_U(
-        U_curr, m_template, inst, distIJ, policy,
-        demand_TM=demand_TM, cumulative_install=cumulative_install
-    )
-
-    best_full_score = float(full0[0])
+    if grb_eval is not None:
+        best_full_score, _ = grb_eval.evaluate(U_curr)
+    else:
+        full0 = full_eval_from_U(
+            U_curr, m_template, inst, distIJ, policy,
+            demand_TM=demand_TM, cumulative_install=cumulative_install
+        )
+        best_full_score = float(full0[0])
     U_best = dict(U_curr)
 
     seen = set()
-    seen_max = 2000  # cap: once full, stop deduplication so DR keeps exploring
+    seen_max = 2000
     def hash_u(U):
         return tuple(sorted(U.items()))
 
     seen.add(hash_u(U_curr))
 
+    U_cap_per_site = (
+        int(max_chargers_per_site)
+        if max_chargers_per_site is not None
+        else int(max(P_T))
+    )
+
+    # proxy gate: ε = proxy_threshold_frac × initial proxy score
+    proxy_gate = proxy_threshold_frac * float(proxy_curr) if proxy_threshold_frac > 0 else 0.0
+    consecutive_rejects = 0
+
     t_start = time.perf_counter()
 
     # =========================
-    # MAIN LOOP (LEFT FLOWCHART)
+    # MAIN LOOP  (ALNS / single-candidate)
     # =========================
     trace_records = []
     eval_id = 0
+
     for it in range(max_iter):
 
         if time.perf_counter() - t_start > dr_time_limit:
             break
 
-        candidate_pool = []
+        # -------------------------
+        # 1) Single candidate: Destroy → Reconstruct
+        # -------------------------
+        base = U_curr if rng.random() < 0.7 else U_best
+
+        mode = (
+            str(rng.choice(destroy_modes))
+            if adaptive_destroy and destroy_modes
+            else destroy_mode
+        )
+
+        U_partial, _ = destroy_multi_u(base, inst, rng, P_T, frac_remove, mode)
+
+        U_recon, _ = reconstruct_u_dict_fast(
+            U_partial, demand_TM, P_T, Ij_int,
+            U_cap=U_cap_per_site, Q=Q_cap, rng=rng
+        )
+
+        # skip exact duplicates (not counted as a proxy reject)
+        h = hash_u(U_recon)
+        if len(seen) < seen_max and h in seen:
+            continue
+        if len(seen) < seen_max:
+            seen.add(h)
+
+        proxy = float(evaluate_u_numpy_greedy_binary(
+            U_recon, demand_TM, J_i_list, distIJ,
+            Q_cap, T, N, cumulative_install
+        ))
+
+        trace_records.append({
+            "eval_id": eval_id, "iteration": it, "phase": "dr",
+            "proxy": proxy, "best_full": float(best_full_score),
+        })
+        eval_id += 1
 
         # -------------------------
-        # 1) Generate candidates
+        # 2) Proxy filter gate  (ε threshold)
         # -------------------------
-        for _ in range(batch_size):
-
-            base = U_curr if rng.random() < 0.7 else U_best
-
-            U_partial, _ = destroy_multi_u(
-                base, inst, rng, P_T, frac_remove, destroy_mode
-            )
-
-            U_cap_per_site = (
-                int(max_chargers_per_site)
-                if max_chargers_per_site is not None
-                else int(max(P_T))          # fallback: no single period can have more than one period's budget
-            )
-
-            U_recon, _ = reconstruct_u_dict_fast(
-                U_partial, demand_TM, P_T, Ij_int,
-                U_cap=U_cap_per_site, Q=Q_cap, rng=rng
-            )
-
-            h = hash_u(U_recon)
-            if len(seen) < seen_max and h in seen:
-                continue
-            if len(seen) < seen_max:
-                seen.add(h)
-
-            proxy = evaluate_u_numpy_greedy_binary(
-                U_recon, demand_TM, J_i_list, distIJ,
-                Q_cap, T, N, cumulative_install
-            )
-
-            candidate_pool.append((proxy, U_recon))
-
-            # log individual proxy evaluation for trace visualisation
+        if proxy < proxy_gate:
+            consecutive_rejects += 1
+            if consecutive_rejects >= adaptive_patience:
+                proxy_gate *= threshold_decay   # lower the bar adaptively
+                consecutive_rejects = 0
             trace_records.append({
-                "eval_id":   eval_id,
-                "iteration": it,
-                "phase":     "dr",
-                "proxy":     float(proxy),
-                "best_full": float(best_full_score),
+                "eval_id": eval_id, "iteration": it, "phase": "skip",
+                "proxy": proxy, "best_full": float(best_full_score),
             })
             eval_id += 1
+            continue  # no incumbent update
 
-        if not candidate_pool:
-            continue
-
-        # -------------------------
-        # 2) Rank by proxy
-        # -------------------------
-        candidate_pool.sort(reverse=True, key=lambda x: x[0])\
+        consecutive_rejects = 0
 
         # -------------------------
-        # 3) Top-k selection
+        # 3) Local search — collect every visited solution
         # -------------------------
-        k = min(top_k_full, len(candidate_pool))
-        top_candidates = candidate_pool[:k]
-
-        # -------------------------
-        # 4) Local Search (ONLY top-k)
-        # -------------------------
-        improved_candidates = []
-
-        for proxy, U in top_candidates:
-            U_ls, proxy_ls = local_search_u_proxy(
-                U, inst, rng, P_T,
-                demand_TM, J_i_list, distIJ,
-                Q_cap, T, N,
-                cumulative_install,
-                max_chargers_per_site,
-                ls_moves, ls_frac_remove, ls_modes,
-                Ij_int=Ij_int,          # 🔥 ADD THIS
-                top_k_choice=top_k_choice
-            )
-            improved_candidates.append((proxy_ls, U_ls))
+        visited, proxy_ls = local_search_u_proxy(
+            U_recon, inst, rng, P_T,
+            demand_TM, J_i_list, distIJ,
+            Q_cap, T, N,
+            cumulative_install,
+            max_chargers_per_site,
+            ls_moves, ls_frac_remove, ls_modes,
+            Ij_int=Ij_int,
+            top_k_choice=top_k_choice,
+            collect_visited=True,
+        )
 
         # -------------------------
-        # 5) Full evaluation
+        # 4) Batch full eval on all LS-visited solutions
+        #    (the proxy-best LS step ≠ the full-eval-best step)
         # -------------------------
-        best_batch_score = -1e18
-        best_batch_U = None
+        best_iter_score = -1e18
+        best_iter_U = None
 
-        for proxy, U in improved_candidates:
-            score, _, _ = full_eval_from_U(
-                U, m_template, inst, distIJ, policy,
-                demand_TM=demand_TM,
-                cumulative_install=cumulative_install
-            )
-
-            if score > best_batch_score:
-                best_batch_score = score
-                best_batch_U = U
+        for U_v in visited:
+            if grb_eval is not None:
+                score, _ = grb_eval.evaluate(U_v)
+            else:
+                score, _, _ = full_eval_from_U(
+                    U_v, m_template, inst, distIJ, policy,
+                    demand_TM=demand_TM,
+                    cumulative_install=cumulative_install
+                )
+            if score > best_iter_score:
+                best_iter_score = score
+                best_iter_U = U_v
 
         # -------------------------
-        # 6) Accept / Update
+        # 5) Accept / Update
         # -------------------------
-        if best_batch_U is not None:
+        if best_iter_U is not None:
+            if best_iter_score >= best_full_score - accept_epsilon:
+                U_curr = dict(best_iter_U)
+                proxy_curr = float(proxy_ls)
+            if best_iter_score > best_full_score:
+                best_full_score = best_iter_score
+                U_best = dict(best_iter_U)
 
-            if best_batch_score >= best_full_score - accept_epsilon:
-                U_curr = dict(best_batch_U)
-                proxy_curr = proxy
-
-            if best_batch_score > best_full_score:
-                best_full_score = best_batch_score
-                U_best = dict(best_batch_U)
-
-        # record one checkpoint per iteration with updated best_full
         trace_records.append({
-            "eval_id":   eval_id,
-            "iteration": it,
-            "phase":     "checkpoint",
-            "proxy":     float(best_batch_score) if best_batch_U is not None else float(proxy_curr),
+            "eval_id": eval_id, "iteration": it, "phase": "checkpoint",
+            "proxy": float(proxy_ls),
             "best_full": float(best_full_score),
         })
         eval_id += 1
+
+    if grb_eval is not None:
+        grb_eval.dispose()
 
     return {
         "U_best": U_best,

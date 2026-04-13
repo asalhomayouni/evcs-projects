@@ -4,6 +4,18 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 
+# Single shared environment — created once per process so that every
+# gp.Model() call reuses the same license slot instead of checking out
+# a new one each time (important on Compute Canada cluster licenses).
+_grb_env: gp.Env | None = None
+
+
+def _get_env() -> gp.Env:
+    global _grb_env
+    if _grb_env is None:
+        _grb_env = gp.Env()
+    return _grb_env
+
 
 # --- key normaliser ---
 def _nk(k):
@@ -174,7 +186,7 @@ def _method_multi(gm, name, distIJ, arcs, Ji, z, y, a, T):
 def build_base_model_grb(M, N, in_range, Ji, Ij, demand_I, Q, P,
                           distIJ=None, method_name="none",
                           allow_multi_charger=False, max_chargers_per_site=None):
-    gm = gp.Model(); gm.setParam("OutputFlag", 0)
+    gm = gp.Model(env=_get_env()); gm.setParam("OutputFlag", 0)
     arcs = list(in_range)
     ub = _site_ub(P, max_chargers_per_site)
     a = {i: float(demand_I[i]) for i in range(M)}
@@ -227,7 +239,7 @@ def build_multi_period_model_grb(M, N, T, in_range, Ji, Ij, demand_IT, Q, P_T,
                                   cumulative_install=True):
     P_T = list(P_T)
     if len(P_T) != T: raise ValueError(f"P_T length must be {T}")
-    gm = gp.Model(); gm.setParam("OutputFlag", 0)
+    gm = gp.Model(env=_get_env()); gm.setParam("OutputFlag", 0)
     arcs = list(in_range)
     ub = _site_ub(max(P_T), max_chargers_per_site)
     d = np.asarray(demand_IT, dtype=float)
