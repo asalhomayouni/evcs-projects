@@ -50,11 +50,18 @@ from evcs.full_eval_grb import GRBEvaluator
 # ARGUMENTS
 # =========================
 parser = argparse.ArgumentParser(description="Collect proxy-trajectory data for learning-based gate study")
+# --- instance parameters (overridden by --config-row if supplied) ---
 parser.add_argument("--csv",            type=str,   default="center_146_Verona_k250.csv")
 parser.add_argument("--seed",           type=int,   default=11)
 parser.add_argument("--D",              type=float, default=2.0)
 parser.add_argument("--T",              type=int,   default=6)
 parser.add_argument("--Q",              type=float, default=20.0)
+# --- configs.tsv job-array entry point ---
+parser.add_argument("--config-row",     type=int,   default=None,
+                    help="Row index in configs.tsv (0-based).  When set, "
+                         "csv/seed/D/T/Q are read from that row and the "
+                         "individual flags above are ignored.")
+# --- trajectory collection ---
 parser.add_argument("--n-trajectories", type=int,   default=1000,
                     help="Number of trajectories to collect (default 1000)")
 parser.add_argument("--ls-moves",       type=int,   default=12,
@@ -62,6 +69,24 @@ parser.add_argument("--ls-moves",       type=int,   default=12,
 parser.add_argument("--no-plot",        action="store_true",
                     help="Skip matplotlib figures (headless / batch mode)")
 args = parser.parse_args()
+
+# -----------------------------------------------------------------------
+# If --config-row was given, load instance params from configs.tsv
+# configs.tsv columns (tab-separated, no header):
+#   row_id  csv_file  seed  D  T  Q
+# -----------------------------------------------------------------------
+CONFIGS_TSV = PROJECT_ROOT / "configs.tsv"
+
+if args.config_row is not None:
+    cfg = pd.read_csv(CONFIGS_TSV, sep="\t", header=None,
+                      names=["row_id", "csv", "seed", "D", "T", "Q"])
+    row = cfg[cfg["row_id"] == args.config_row].iloc[0]
+    args.csv  = str(row["csv"]).strip()
+    args.seed = int(row["seed"])
+    args.D    = float(row["D"])
+    args.T    = int(row["T"])
+    args.Q    = float(row["Q"])
+    print(f"[config-row {args.config_row}] {args.csv}  seed={args.seed}  D={args.D}  T={args.T}  Q={args.Q}")
 
 DATA_DIR    = PROJECT_ROOT / "data" / "input"
 RESULTS_DIR = PROJECT_ROOT / "results" / "trajectories"
@@ -133,6 +158,13 @@ def main():
     top_k_choice          = 3
     cumulative_install    = True
     policy                = "closest_priority"
+
+    # Output sub-directory: one folder per instance so parallel runs don't collide
+    instance_tag = Path(args.csv).stem
+    if args.config_row is not None:
+        instance_tag = f"row{args.config_row}_{instance_tag}"
+    out_dir = RESULTS_DIR / instance_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # -------------------------
     # Load instance
@@ -302,7 +334,7 @@ def main():
     # Save CSV
     # -------------------------
     df = pd.DataFrame(records)
-    csv_out = RESULTS_DIR / "trajectories.csv"
+    csv_out = out_dir / "trajectories.csv"
     df.to_csv(csv_out, index=False)
     print(f"Saved: {csv_out}")
 
@@ -441,7 +473,7 @@ def main():
     ax.set_title(f"proxy_0 vs full_eval  (r={corrs_abs[0]:.3f})")
 
     fig1.tight_layout()
-    fig1_path = RESULTS_DIR / "trajectory_analysis_absolute.png"
+    fig1_path = out_dir / "trajectory_analysis_absolute.png"
     fig1.savefig(fig1_path, dpi=150, bbox_inches="tight")
     print(f"\nFigure saved: {fig1_path}")
 
@@ -499,7 +531,7 @@ def main():
     ax.set_title(f"Initial proxy vs improvement over incumbent  (r={corrs_delta[0]:+.3f})")
 
     fig2.tight_layout()
-    fig2_path = RESULTS_DIR / "trajectory_analysis_delta.png"
+    fig2_path = out_dir / "trajectory_analysis_delta.png"
     fig2.savefig(fig2_path, dpi=150, bbox_inches="tight")
     print(f"Figure saved: {fig2_path}")
 
