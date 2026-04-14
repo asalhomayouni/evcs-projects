@@ -47,6 +47,8 @@ def local_search_u_proxy(
     ))
 
     visited = [dict(U_start)] if collect_visited else None
+    # proxy_scores[0] = proxy of U_start; proxy_scores[k] = proxy after kth LS move
+    proxy_scores = [proxy_best] if collect_visited else None
 
     for _ in range(int(ls_moves)):
         mode = str(rng.choice(list(ls_modes)))
@@ -88,11 +90,12 @@ def local_search_u_proxy(
 
         if collect_visited:
             visited.append(dict(U_fill))
+            proxy_scores.append(proxy_try)
 
         if proxy_try > proxy_best + 1e-9:
             U_best = dict(U_fill)
             proxy_best = float(proxy_try)
 
     if collect_visited:
-        return visited, float(proxy_best)
+        return visited, proxy_scores, float(proxy_best)
     return U_best, float(proxy_best)

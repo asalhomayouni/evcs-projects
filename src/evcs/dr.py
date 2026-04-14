@@ -556,7 +556,7 @@ def run_DR_multi(
         # -------------------------
         # 3) Local search — collect every visited solution
         # -------------------------
-        visited, proxy_ls = local_search_u_proxy(
+        visited, _proxy_scores_ls, proxy_ls = local_search_u_proxy(
             U_recon, inst, rng, P_T,
             demand_TM, J_i_list, distIJ,
             Q_cap, T, N,
