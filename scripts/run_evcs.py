@@ -14,10 +14,12 @@ SRC_DIR = PROJECT_ROOT / "src"
 sys.path.append(str(SRC_DIR))
 
 from evcs import (
-    build_multi_period_model,
-    solve_model,
+    # build_multi_period_model,  # Pyomo version — replaced by GurobiPy direct below
+    # solve_model,               # Pyomo version — replaced by GurobiPy direct below
     run_DR_multi
 )
+from evcs.model_grb import build_multi_period_model_grb
+from evcs.solve_grb import solve_model_grb
 
 from evcs.methods import sync_solution_state, reassign_y_greedy_multi
 from evcs.geom import build_arcs
@@ -33,10 +35,16 @@ parser.add_argument("--T",           type=int,   default=6)
 parser.add_argument("--Q",           type=float, default=20.0)
 parser.add_argument("--reset-excel", action="store_true",
                     help="Clear benchmark_with_SLURM.xlsx before running (fresh start for new array job)")
-parser.add_argument("--proxy-gate",  type=float, default=0.0,
+parser.add_argument("--proxy-gate",   type=float, default=0.0,
                     help="proxy_threshold_frac for ALNS gate (0=disabled, e.g. 0.92)")
-parser.add_argument("--label",       type=str,   default="",
+parser.add_argument("--label",        type=str,   default="",
                     help="Short tag written to Excel to distinguish runs (e.g. 'alns_gate_0.92')")
+parser.add_argument("--dr-time",      type=float, default=300.0,
+                    help="DR time limit in seconds (default 300)")
+parser.add_argument("--exact-time",   type=float, default=120.0,
+                    help="Exact solver time limit in seconds (default 120)")
+parser.add_argument("--no-exact",     action="store_true",
+                    help="Skip the exact solver entirely (DR benchmark only)")
 args = parser.parse_args()
 
 # =========================
@@ -56,8 +64,8 @@ policy                = "closest_priority"
 max_chargers_per_site = 6
 
 # DR parameters
-max_iter       = 5000    
-dr_time_limit  = 2000    
+max_iter       = 5000
+dr_time_limit  = args.dr_time
 batch_size     = 50
 top_k_full     = 8
 ls_moves       = 12
@@ -69,8 +77,8 @@ proxy_gate     = args.proxy_gate
 destroy_modes  = ["site_swap", "local_remove", "area_destroy"]
 
 # Exact solver
-exact_time_limit = 10000    
-mip_gap          = 0.001
+exact_time_limit = args.exact_time
+mip_gap          = 0.00001
 
 
 # =========================
@@ -127,11 +135,11 @@ def build_instance_from_csv(csv_path, T, seed, D_km):
 # MAIN
 # =========================
 BENCHMARK_COLUMNS = [
-    "Timestamp", "Instance", "Policy", "N", "M", "T", "seed", "D_km", "Q",
+    "Timestamp", "Label", "Instance", "Policy", "N", "M", "T", "seed", "D_km", "Q",
     "P_T", "max_chargers_per_site", "|A|", "arc_density", "total_demand",
     "Exact_incumbent_raw", "Exact_bound_raw", "Exact_gap_raw", "Exact_time_s",
-    "DR_best", "DR_iters", "DR_time_s", "DR_time_limit_s",
-    "batch_size", "top_k_full", "ls_moves", "max_iter", "frac_remove", "accept_epsilon",
+    "DR_best", "DR_iters", "DR_skips", "DR_time_s", "DR_time_limit_s",
+    "proxy_gate", "ls_moves", "max_iter", "frac_remove", "accept_epsilon",
     "Gap_%", "Total_time_s", "Trace_sheet",
 ]
 
@@ -171,7 +179,7 @@ def run_single_experiment():
     # -------------------------
     # DR
     # -------------------------
-    print("\n Running DR...")
+    print(f"\n Running DR  (limit={dr_time_limit}s, max_iter={max_iter}, gate={proxy_gate}) ...")
     t_dr_start = time.time()
 
     dr_out = run_DR_multi(
@@ -193,6 +201,8 @@ def run_single_experiment():
         top_k_full=top_k_full,
         ls_moves=ls_moves,
         ls_frac_remove=ls_frac_remove,
+        proxy_threshold_frac=proxy_gate,
+        use_grb_eval=True,
     )
 
     t_dr_end = time.time()
@@ -202,43 +212,46 @@ def run_single_experiment():
     # -------------------------
     # EXACT
     # -------------------------
-    print("\n Running Exact...")
-    t_exact_start = time.time()
+    exact_inc_raw = exact_bound_raw = exact_gap_raw = None
+    t_exact_start = t_exact_end = time.time()
 
-    model = build_multi_period_model(
-        M=M, N=N, T=T,
-        in_range=in_range,
-        Ji=Ji,
-        Ij=Ij,
-        demand_IT=demand_IT,
-        Q=Q,
-        P_T=P_T_local,
-        distIJ=distIJ,
-        method_name=policy,
-        max_chargers_per_site=max_chargers_per_site,
-    )
+    if not args.no_exact:
+        print(f"\n Running Exact (limit={exact_time_limit}s)...")
+        t_exact_start = time.time()
 
-    res = solve_model(
-        model,
-        time_limit=exact_time_limit,
-        mip_gap=mip_gap,
-        solver_name="gurobi",
-    )
+        model = build_multi_period_model_grb(
+            M=M, N=N, T=T,
+            in_range=in_range,
+            Ji=Ji,
+            Ij=Ij,
+            demand_IT=demand_IT,
+            Q=Q,
+            P_T=P_T_local,
+            distIJ=distIJ,
+            method_name=policy,
+            max_chargers_per_site=max_chargers_per_site,
+        )
 
-    t_exact_end = time.time()
+        res = solve_model_grb(
+            model,
+            time_limit=exact_time_limit,
+            mip_gap=mip_gap,
+        )
 
-    exact_inc_raw  = getattr(res, "best_feasible_objective", None)
-    exact_bound_raw = getattr(res, "best_objective_bound", None)
+        t_exact_end = time.time()
 
-    if exact_inc_raw is not None:
-        exact_inc_raw = float(exact_inc_raw)
-    if exact_bound_raw is not None:
-        exact_bound_raw = float(exact_bound_raw)
+        exact_inc_raw   = getattr(res, "best_feasible_objective", None)
+        exact_bound_raw = getattr(res, "best_objective_bound", None)
 
-    if exact_inc_raw is not None and exact_bound_raw is not None:
-        exact_gap_raw = abs(exact_inc_raw - exact_bound_raw) / max(abs(exact_inc_raw), 1e-9)
+        if exact_inc_raw is not None:
+            exact_inc_raw = float(exact_inc_raw)
+        if exact_bound_raw is not None:
+            exact_bound_raw = float(exact_bound_raw)
+
+        if exact_inc_raw is not None and exact_bound_raw is not None:
+            exact_gap_raw = abs(exact_inc_raw - exact_bound_raw) / max(abs(exact_inc_raw), 1e-9)
     else:
-        exact_gap_raw = None
+        print("\n Skipping exact solver (--no-exact)")
 
     # -------------------------
     # Evaluate EXACT with greedy assignment
@@ -280,9 +293,13 @@ def run_single_experiment():
     excel_file = bench_dir / "benchmark_with_SLURM.xlsx"
 
     # ---- build row ----
+    trace_df = dr_out.get("DR_trace")
+    dr_skips = int((trace_df["phase"] == "skip").sum()) if trace_df is not None and "phase" in trace_df.columns else 0
+
     row = {
         # run identity
         "Timestamp":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Label":                args.label,
         "Instance":             Path(CSV_NAME).stem,
         "Policy":               policy,
         "N":                    N,
@@ -307,11 +324,11 @@ def run_single_experiment():
 
         # DR
         "DR_best":              round(dr_best, 4),
-        "DR_iters":             int((dr_out["DR_trace"]["phase"] == "checkpoint").sum()) if dr_out.get("DR_trace") is not None and "phase" in dr_out["DR_trace"].columns else len(dr_out.get("DR_trace", [])),
+        "DR_iters":             int((trace_df["phase"] == "checkpoint").sum()) if trace_df is not None and "phase" in trace_df.columns else 0,
+        "DR_skips":             dr_skips,
         "DR_time_s":            round(t_dr_end - t_dr_start, 2),
         "DR_time_limit_s":      dr_time_limit,
-        "batch_size":           batch_size,
-        "top_k_full":           top_k_full,
+        "proxy_gate":           proxy_gate,
         "ls_moves":             ls_moves,
         "max_iter":             max_iter,
         "frac_remove":          frac_remove,
@@ -361,8 +378,7 @@ def run_single_experiment():
         df_all = df_new
 
     # ---- assign trace sheet name for this row ----
-    trace     = dr_out.get("DR_trace")
-    has_trace = trace is not None and len(trace) > 0
+    has_trace = trace_df is not None and len(trace_df) > 0
     trace_sheet_name = f"t{len(df_all) - 1}" if has_trace else None
     if trace_sheet_name:
         df_all.loc[len(df_all) - 1, "Trace_sheet"] = trace_sheet_name
@@ -376,7 +392,7 @@ def run_single_experiment():
                 sdf.to_excel(writer, sheet_name=sname, index=False)
             # write new trace sheet
             if has_trace:
-                trace.to_excel(writer, sheet_name=trace_sheet_name, index=False)
+                trace_df.to_excel(writer, sheet_name=trace_sheet_name, index=False)
 
     try:
         _write_excel(excel_file)

@@ -606,6 +606,10 @@ def run_DR_multi(
         })
         eval_id += 1
 
+        skips_total = sum(1 for r in trace_records if r["phase"] == "skip")
+        print(f"  iter {it:4d}  best={best_full_score:.4f}  skips={skips_total}", flush=True)
+
+
     if grb_eval is not None:
         grb_eval.dispose()
 
