@@ -33,6 +33,10 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import StandardScaler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -395,7 +399,10 @@ def main():
 
     frac_positive_delta = float((delta > 0).mean())
     print(f"\nFraction of trajectories that improved over incumbent: {frac_positive_delta:.3f}")
-    
+    # Before the regression block, add:
+    if X.shape[0] == 0:
+        print("  No complete trajectories — skipping regression.")
+        return
     # -------------------------
     # REGRESSION  (two targets: absolute and delta)
     # -------------------------
