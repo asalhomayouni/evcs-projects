@@ -33,7 +33,6 @@ import sys
 import numpy as np
 import pandas as pd
 import matplotlib
-import matplotlib.pyplot as plt
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -42,7 +41,8 @@ sys.path.append(str(SRC_DIR))
 from evcs.geom import build_arcs
 from evcs.proxy import evaluate_u_numpy_greedy_binary
 from evcs.destroy import destroy_multi_u
-from evcs.greedy import reconstruct_u_dict_fast, greedy_schedule_multi_from_variants
+from evcs.greedy import reconstruct_u_dict_fast
+from evcs.methods import greedy_schedule_multi_from_variants
 from evcs.local_search import local_search_u_proxy
 from evcs.full_eval_grb import GRBEvaluator
 
@@ -69,6 +69,11 @@ parser.add_argument("--ls-moves",       type=int,   default=12,
 parser.add_argument("--no-plot",        action="store_true",
                     help="Skip matplotlib figures (headless / batch mode)")
 args = parser.parse_args()
+
+# Set backend BEFORE importing pyplot — must happen here, at module level
+if args.no_plot:
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 
 # -----------------------------------------------------------------------
 # If --config-row was given, load instance params from configs.tsv
@@ -307,15 +312,18 @@ def main():
         # 6) Record trajectory
         #    incumbent_full_eval = best_full_score *before* this LS run
         #    full_eval_delta     = improvement over that incumbent (negative = worse)
+        #    proxy_scores may be shorter than ls_moves+1 if LS stopped early;
+        #    pad with None so every row has the same columns (→ NaN in CSV/DataFrame)
         record = {
-            "traj_id":           len(records),
-            "iter":              it,
+            "traj_id":             len(records),
+            "iter":                it,
             "incumbent_full_eval": float(incumbent_full_score),
-            "full_eval":         float(full_score),
-            "full_eval_delta":   float(full_score) - float(incumbent_full_score),
+            "full_eval":           float(full_score),
+            "full_eval_delta":     float(full_score) - float(incumbent_full_score),
+            "ls_steps_taken":      len(proxy_scores) - 1,  # steps actually executed
         }
-        for k, p in enumerate(proxy_scores):
-            record[f"proxy_{k}"] = float(p)
+        for k in range(LS_MOVES + 1):
+            record[f"proxy_{k}"] = float(proxy_scores[k]) if k < len(proxy_scores) else float("nan")
         records.append(record)
 
         if len(records) % 100 == 0:
@@ -344,7 +352,11 @@ def main():
     # ANALYSIS
     # -------------------------
     print("\n===== ANALYSIS =====")
-    print(df[["full_eval", "full_eval_delta"] + proxy_cols].describe().to_string())
+    print(df[["full_eval", "full_eval_delta", "ls_steps_taken"] + proxy_cols].describe().to_string())
+
+    # Early-stop distribution
+    print("\nLS steps-taken distribution (hill-climbing early stop):")
+    print(df["ls_steps_taken"].value_counts().sort_index().to_string())
 
     steps   = list(range(LS_MOVES + 1))
     fe      = df["full_eval"].to_numpy(dtype=float)
@@ -353,24 +365,37 @@ def main():
 
     delta   = df["full_eval_delta"].to_numpy(dtype=float)
 
+    def _pearson_dropna(col_vals, target):
+        """Pearson r ignoring rows where col_vals is NaN (early-stopped trajectories)."""
+        mask = ~np.isnan(col_vals)
+        if mask.sum() < 10:
+            return float("nan")
+        return float(np.corrcoef(col_vals[mask], target[mask])[0, 1])
+
     # --- Pearson r(proxy_k, full_eval)  [absolute quality] ---
-    corrs_abs = [float(np.corrcoef(df[f"proxy_{k}"].values, fe)[0, 1])    for k in steps]
+    corrs_abs   = [_pearson_dropna(df[f"proxy_{k}"].to_numpy(dtype=float), fe)    for k in steps]
     # --- Pearson r(proxy_k, full_eval_delta)  [improvement over incumbent] ---
-    corrs_delta = [float(np.corrcoef(df[f"proxy_{k}"].values, delta)[0, 1]) for k in steps]
+    corrs_delta = [_pearson_dropna(df[f"proxy_{k}"].to_numpy(dtype=float), delta) for k in steps]
 
     print("\nPearson r(proxy_k, full_eval)          r(proxy_k, full_eval_delta):")
     for k, (ra, rd) in enumerate(zip(corrs_abs, corrs_delta)):
         print(f"  step {k:2d}:  abs={ra:+.4f}   delta={rd:+.4f}")
 
     # Proxy-improvement vs full_eval_delta: does LS proxy gain predict true gain?
-    proxy_improvement = df[proxy_cols[-1]].values - df["proxy_0"].values
-    r_imp_delta = float(np.corrcoef(proxy_improvement, delta)[0, 1])
+    # Use the last non-NaN proxy value per row (the plateau the search settled at)
+    proxy_final_actual = df[proxy_cols].apply(
+        lambda row: row.dropna().iloc[-1] if row.dropna().shape[0] > 0 else float("nan"),
+        axis=1
+    ).to_numpy(dtype=float)
+    proxy_improvement = proxy_final_actual - df["proxy_0"].to_numpy(dtype=float)
+    _mask_imp = ~np.isnan(proxy_improvement)
+    r_imp_delta = float(np.corrcoef(proxy_improvement[_mask_imp], delta[_mask_imp])[0, 1])
     print(f"\nr(proxy_improvement, full_eval_delta) = {r_imp_delta:+.4f}")
     print("  (proxy improvement = proxy_final - proxy_0 within one LS run)")
 
     frac_positive_delta = float((delta > 0).mean())
     print(f"\nFraction of trajectories that improved over incumbent: {frac_positive_delta:.3f}")
-
+    
     # -------------------------
     # REGRESSION  (two targets: absolute and delta)
     # -------------------------
@@ -382,43 +407,53 @@ def main():
     import warnings
     warnings.filterwarnings("ignore")
 
-    X       = df[proxy_cols].to_numpy(dtype=float)
-    scaler  = StandardScaler()
-    X_s     = scaler.fit_transform(X)
-    X_final = df[[proxy_cols[-1]]].to_numpy(dtype=float)
+    # Only use proxy columns that have enough non-NaN rows (early stop makes later cols sparse)
+    MIN_SAMPLES = max(10, int(0.01 * len(df)))
+    active_proxy_cols = [c for c in proxy_cols if df[c].notna().sum() >= MIN_SAMPLES]
+    print(f"\nProxy columns with ≥{MIN_SAMPLES} non-NaN rows: {active_proxy_cols}")
 
-    for target_name, y_target in [
-        ("full_eval       (absolute)", fe),
-        ("full_eval_delta (improvement)", delta),
-    ]:
-        print(f"\n  Target: {target_name}")
-        for name, clf, X_fit in [
-            ("LinearRegression  — all proxy steps",  LinearRegression(),                                     X_s),
-            ("LinearRegression  — final proxy only", LinearRegression(),                                     X_final),
-            ("RandomForest      — all proxy steps",  RandomForestRegressor(n_estimators=200, random_state=0), X_s),
-            ("GradientBoosting  — all proxy steps",  GradientBoostingRegressor(n_estimators=200, random_state=0), X_s),
+    df_full = df[active_proxy_cols + ["full_eval", "full_eval_delta"]].dropna()
+    print(f"Rows usable for regression: {len(df_full)}/{len(df)}")
+
+    if len(df_full) < 10:
+        print("  Too few rows for regression — skipping.")
+    else:
+        X       = df_full[active_proxy_cols].to_numpy(dtype=float)
+        scaler  = StandardScaler()
+        X_s     = scaler.fit_transform(X)
+        X_final = df_full[[active_proxy_cols[-1]]].to_numpy(dtype=float)
+
+        fe_full    = df_full["full_eval"].to_numpy(dtype=float)
+        delta_full = df_full["full_eval_delta"].to_numpy(dtype=float)
+
+        for target_name, y_target in [
+            ("full_eval       (absolute)", fe_full),
+            ("full_eval_delta (improvement)", delta_full),
         ]:
-            cv_r2 = cross_val_score(clf, X_fit, y_target, cv=5, scoring="r2")
-            print(f"    {name:50s}  CV R² = {cv_r2.mean():+.4f} ± {cv_r2.std():.4f}")
+            print(f"\n  Target: {target_name}")
+            for name, clf, X_fit in [
+                ("LinearRegression  — all active steps",  LinearRegression(),                                      X_s),
+                ("LinearRegression  — final active step", LinearRegression(),                                      X_final),
+                ("RandomForest      — all active steps",  RandomForestRegressor(n_estimators=200, random_state=0), X_s),
+                ("GradientBoosting  — all active steps",  GradientBoostingRegressor(n_estimators=200, random_state=0), X_s),
+            ]:
+                cv_r2 = cross_val_score(clf, X_fit, y_target, cv=5, scoring="r2")
+                print(f"    {name:50s}  CV R² = {cv_r2.mean():+.4f} ± {cv_r2.std():.4f}")
 
-    # Feature importances from RF for each target
-    for target_name, y_target in [
-        ("full_eval", fe),
-        ("full_eval_delta", delta),
-    ]:
-        rf = RandomForestRegressor(n_estimators=200, random_state=0)
-        rf.fit(X_s, y_target)
-        importances = rf.feature_importances_
-        print(f"\nRF importances → {target_name}:")
-        for k, imp in enumerate(importances):
-            print(f"  proxy_{k}: {imp:.4f}")
+        for target_name, y_target in [
+            ("full_eval", fe_full),
+            ("full_eval_delta", delta_full),
+        ]:
+            rf = RandomForestRegressor(n_estimators=200, random_state=0)
+            rf.fit(X_s, y_target)
+            importances = rf.feature_importances_
+            print(f"\nRF importances → {target_name}:")
+            for col, imp in zip(active_proxy_cols, importances):
+                print(f"  {col}: {imp:.4f}")
 
     # -------------------------
     # PLOTS
     # -------------------------
-    if not SHOW_PLOT:
-        matplotlib.use("Agg")
-
     # Colour helpers
     delta_min, delta_max = delta.min(), delta.max()
     delta_norm = (delta - delta_min) / max(delta_max - delta_min, 1e-12)
@@ -456,7 +491,7 @@ def main():
     ax.set_ylabel("Pearson r(proxy_k, full_eval)")
     ax.set_title("Absolute predictive power vs step")
     ax.set_xticks(steps)
-    ax.set_ylim(min(0, min(corrs_abs)) - 0.05, 1.05)
+    ax.set_ylim(min(0, float(np.nanmin(corrs_abs))) - 0.05, 1.05)
 
     # Panel 3: scatter proxy_final vs full_eval
     ax = axes[1, 0]
@@ -503,19 +538,19 @@ def main():
 
     # Panel 2: r(proxy_k, full_eval_delta) per step
     ax = axes2[0, 1]
-    colors = ["steelblue" if r >= 0 else "firebrick" for r in corrs_delta]
+    colors = ["steelblue" if (not np.isnan(r) and r >= 0) else "firebrick" for r in corrs_delta]
     ax.bar(steps, corrs_delta, color=colors)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xlabel("LS step k")
     ax.set_ylabel("Pearson r(proxy_k, full_eval_delta)")
     ax.set_title("Does proxy_k predict improvement over incumbent?")
     ax.set_xticks(steps)
-    lo = min(min(corrs_delta) - 0.05, -0.1)
-    ax.set_ylim(lo, max(max(corrs_delta) + 0.05, 0.2))
+    lo = min(float(np.nanmin(corrs_delta)) - 0.05, -0.1)
+    ax.set_ylim(lo, max(float(np.nanmax(corrs_delta)) + 0.05, 0.2))
 
     # Panel 3: proxy improvement (proxy_final - proxy_0) vs full_eval_delta
     ax = axes2[1, 0]
-    ax.scatter(proxy_improvement, delta, alpha=0.3, s=8, color="mediumseagreen")
+    ax.scatter(proxy_improvement[_mask_imp], delta[_mask_imp], alpha=0.3, s=8, color="mediumseagreen")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
     ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
     ax.set_xlabel("proxy improvement within LS  (proxy_final − proxy_0)")

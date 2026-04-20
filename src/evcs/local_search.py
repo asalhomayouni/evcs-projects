@@ -95,6 +95,8 @@ def local_search_u_proxy(
         if proxy_try > proxy_best + 1e-9:
             U_best = dict(U_fill)
             proxy_best = float(proxy_try)
+        else:
+            break  # local optimum: no improving neighbour found, stop early
 
     if collect_visited:
         return visited, proxy_scores, float(proxy_best)
