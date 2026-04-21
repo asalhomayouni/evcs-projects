@@ -1,17 +1,17 @@
 """
-Trajectory data-gathering experiment — learning-based gate study.
+Trajectory data-gathering experiment -- learning-based gate study.
 
 Runs the ALNS loop with the proxy gate DISABLED (dumb mode / let everything
 through) and records, for each destroy-repair candidate that enters local
 search:
 
-    proxy_0, proxy_1, ..., proxy_{ls_moves}  — proxy score at every LS step
-    full_eval                                  — Gurobi LP score of U_best
+    proxy_0, proxy_1, ..., proxy_{ls_moves}  -- proxy score at every LS step
+    full_eval                                  -- Gurobi LP score of U_best
                                                  (the proxy-best solution
                                                   found during that LS run)
 
 After collecting ~N_TRAJ trajectories the script:
-  1. Saves raw data → results/trajectories/trajectories.csv
+  1. Saves raw data -> results/trajectories/trajectories.csv
   2. Plots trajectory bundles coloured by final full-eval quality
   3. Plots per-step Pearson correlation with final full-eval
   4. Runs Linear Regression + Random-Forest regression and reports R²
@@ -74,7 +74,7 @@ parser.add_argument("--no-plot",        action="store_true",
                     help="Skip matplotlib figures (headless / batch mode)")
 args = parser.parse_args()
 
-# Set backend BEFORE importing pyplot — must happen here, at module level
+# Set backend BEFORE importing pyplot -- must happen here, at module level
 if args.no_plot:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -253,7 +253,7 @@ def main():
     while len(records) < N_TRAJ:
         it += 1
 
-        # 1) Destroy → Reconstruct
+        # 1) Destroy -> Reconstruct
         base = U_curr if rng.random() < 0.7 else U_best
         mode = str(rng.choice(destroy_modes))
 
@@ -277,7 +277,7 @@ def main():
         # 2) Snapshot incumbent *before* LS so we can compute full_eval delta later
         incumbent_full_score = best_full_score
 
-        # 3) Local search — collect proxy trajectory
+        # 3) Local search -- collect proxy trajectory
         #    Gate is DISABLED: every candidate goes through LS
         visited, proxy_scores, proxy_ls = local_search_u_proxy(
             U_recon, inst, rng, P_T,
@@ -306,7 +306,7 @@ def main():
 
         full_score, _ = grb_eval.evaluate(U_ls_best)
 
-        # 5) Update incumbent (optional — keeps the ALNS "alive")
+        # 5) Update incumbent (optional -- keeps the ALNS "alive")
         if full_score >= best_full_score - 1e-4:
             U_curr = dict(U_ls_best)
         if full_score > best_full_score:
@@ -317,7 +317,7 @@ def main():
         #    incumbent_full_eval = best_full_score *before* this LS run
         #    full_eval_delta     = improvement over that incumbent (negative = worse)
         #    proxy_scores may be shorter than ls_moves+1 if LS stopped early;
-        #    pad with None so every row has the same columns (→ NaN in CSV/DataFrame)
+        #    pad with None so every row has the same columns (-> NaN in CSV/DataFrame)
         record = {
             "traj_id":             len(records),
             "iter":                it,
@@ -392,6 +392,11 @@ def main():
         axis=1
     ).to_numpy(dtype=float)
     proxy_improvement = proxy_final_actual - df["proxy_0"].to_numpy(dtype=float)
+
+    # Correlation of last-accepted proxy with full_eval (used in fig1 panel 3)
+    _mask_final = ~np.isnan(proxy_final_actual)
+    r_proxy_final_fe = float(np.corrcoef(proxy_final_actual[_mask_final], fe[_mask_final])[0, 1]) \
+        if _mask_final.sum() >= 2 else float("nan")
     _mask_imp = ~np.isnan(proxy_improvement)
     r_imp_delta = float(np.corrcoef(proxy_improvement[_mask_imp], delta[_mask_imp])[0, 1])
     print(f"\nr(proxy_improvement, full_eval_delta) = {r_imp_delta:+.4f}")
@@ -400,8 +405,17 @@ def main():
     frac_positive_delta = float((delta > 0).mean())
     print(f"\nFraction of trajectories that improved over incumbent: {frac_positive_delta:.3f}")
     # Before the regression block, add:
+    # Only use proxy columns with enough non-NaN rows
+    valid_cols = [c for c in proxy_cols if df[c].notna().sum() >= 10]
+    if len(valid_cols) == 0:
+        print("  No usable proxy columns -- skipping regression and plots.")
+        return
+    X_df = df[valid_cols].copy()
+    for col in valid_cols:
+        X_df[col] = X_df[col].fillna(df["proxy_0"])
+    X = X_df.values
     if X.shape[0] == 0:
-        print("  No complete trajectories — skipping regression.")
+        print("  No complete trajectories -- skipping regression.")
         return
     # -------------------------
     # REGRESSION  (two targets: absolute and delta)
@@ -417,13 +431,13 @@ def main():
     # Only use proxy columns that have enough non-NaN rows (early stop makes later cols sparse)
     MIN_SAMPLES = max(10, int(0.01 * len(df)))
     active_proxy_cols = [c for c in proxy_cols if df[c].notna().sum() >= MIN_SAMPLES]
-    print(f"\nProxy columns with ≥{MIN_SAMPLES} non-NaN rows: {active_proxy_cols}")
+    print(f"\nProxy columns with >={MIN_SAMPLES} non-NaN rows: {active_proxy_cols}")
 
     df_full = df[active_proxy_cols + ["full_eval", "full_eval_delta"]].dropna()
     print(f"Rows usable for regression: {len(df_full)}/{len(df)}")
 
     if len(df_full) < 10:
-        print("  Too few rows for regression — skipping.")
+        print("  Too few rows for regression -- skipping.")
     else:
         X       = df_full[active_proxy_cols].to_numpy(dtype=float)
         scaler  = StandardScaler()
@@ -439,10 +453,10 @@ def main():
         ]:
             print(f"\n  Target: {target_name}")
             for name, clf, X_fit in [
-                ("LinearRegression  — all active steps",  LinearRegression(),                                      X_s),
-                ("LinearRegression  — final active step", LinearRegression(),                                      X_final),
-                ("RandomForest      — all active steps",  RandomForestRegressor(n_estimators=200, random_state=0), X_s),
-                ("GradientBoosting  — all active steps",  GradientBoostingRegressor(n_estimators=200, random_state=0), X_s),
+                ("LinearRegression  -- all active steps",  LinearRegression(),                                      X_s),
+                ("LinearRegression  -- final active step", LinearRegression(),                                      X_final),
+                ("RandomForest      -- all active steps",  RandomForestRegressor(n_estimators=200, random_state=0), X_s),
+                ("GradientBoosting  -- all active steps",  GradientBoostingRegressor(n_estimators=200, random_state=0), X_s),
             ]:
                 cv_r2 = cross_val_score(clf, X_fit, y_target, cv=5, scoring="r2")
                 print(f"    {name:50s}  CV R² = {cv_r2.mean():+.4f} ± {cv_r2.std():.4f}")
@@ -454,23 +468,27 @@ def main():
             rf = RandomForestRegressor(n_estimators=200, random_state=0)
             rf.fit(X_s, y_target)
             importances = rf.feature_importances_
-            print(f"\nRF importances → {target_name}:")
+            print(f"\nRF importances -> {target_name}:")
             for col, imp in zip(active_proxy_cols, importances):
                 print(f"  {col}: {imp:.4f}")
 
     # -------------------------
     # PLOTS
     # -------------------------
+    # Only show steps that actually have data
+    max_actual_step = int(df["ls_steps_taken"].max())
+    plot_steps = list(range(max_actual_step + 1))
+
     # Colour helpers
     delta_min, delta_max = delta.min(), delta.max()
     delta_norm = (delta - delta_min) / max(delta_max - delta_min, 1e-12)
 
     # -----------------------------------------------------------------------
-    # Figure 1 — absolute quality (full_eval)
+    # Figure 1 -- absolute quality (full_eval)
     # -----------------------------------------------------------------------
     fig1, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig1.suptitle(
-        f"Proxy-trajectory study — absolute quality  |  {len(records)} trajectories  |  {args.csv}",
+        f"Proxy-trajectory study -- absolute quality  |  {len(records)} trajectories  |  {args.csv}",
         fontsize=12
     )
 
@@ -480,32 +498,35 @@ def main():
     idx_sample = np.random.default_rng(0).choice(len(df), size=min(200, len(df)), replace=False)
     for idx in idx_sample:
         row = df.iloc[idx]
-        traj = [row[f"proxy_{k}"] for k in steps]
-        ax.plot(steps, traj, color=cmap(fe_norm[idx]), alpha=0.25, linewidth=0.8)
+        raw  = [row[f"proxy_{k}"] for k in plot_steps if not np.isnan(row[f"proxy_{k}"])]
+        xs   = [k for k in plot_steps if not np.isnan(row[f"proxy_{k}"])]
+        traj = list(np.maximum.accumulate(raw))   # running max: LS only accepts improvements
+        ax.plot(xs, traj, color=cmap(fe_norm[idx]), alpha=0.25, linewidth=0.8)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(fe_min, fe_max))
     sm.set_array([])
     plt.colorbar(sm, ax=ax, label="full_eval")
     ax.set_xlabel("LS step")
     ax.set_ylabel("proxy score")
     ax.set_title("Proxy trajectories (colour = final full-eval)")
-    ax.set_xticks(steps)
+    ax.set_xticks(plot_steps)
 
     # Panel 2: r(proxy_k, full_eval) per step
     ax = axes[0, 1]
-    ax.bar(steps, corrs_abs, color="steelblue")
+    corrs_abs_plot = corrs_abs[:max_actual_step + 1]
+    ax.bar(plot_steps, corrs_abs_plot, color="steelblue")
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xlabel("LS step k")
     ax.set_ylabel("Pearson r(proxy_k, full_eval)")
     ax.set_title("Absolute predictive power vs step")
-    ax.set_xticks(steps)
-    ax.set_ylim(min(0, float(np.nanmin(corrs_abs))) - 0.05, 1.05)
+    ax.set_xticks(plot_steps)
+    ax.set_ylim(min(0, float(np.nanmin(corrs_abs_plot))) - 0.05, 1.05)
 
-    # Panel 3: scatter proxy_final vs full_eval
+    # Panel 3: scatter proxy_final (last accepted) vs full_eval
     ax = axes[1, 0]
-    ax.scatter(df[proxy_cols[-1]], fe, alpha=0.3, s=8, color="steelblue")
-    ax.set_xlabel(f"proxy_{LS_MOVES}  (final LS proxy)")
+    ax.scatter(proxy_final_actual, fe, alpha=0.3, s=8, color="steelblue")
+    ax.set_xlabel("proxy_final  (last accepted LS proxy)")
     ax.set_ylabel("full_eval")
-    ax.set_title(f"proxy_final vs full_eval  (r={corrs_abs[-1]:.3f})")
+    ax.set_title(f"proxy_final vs full_eval  (r={r_proxy_final_fe:.3f})")
 
     # Panel 4: scatter proxy_0 vs full_eval (D&R output alone)
     ax = axes[1, 1]
@@ -520,11 +541,11 @@ def main():
     print(f"\nFigure saved: {fig1_path}")
 
     # -----------------------------------------------------------------------
-    # Figure 2 — delta analysis (improvement over incumbent)
+    # Figure 2 -- delta analysis (improvement over incumbent)
     # -----------------------------------------------------------------------
     fig2, axes2 = plt.subplots(2, 2, figsize=(14, 10))
     fig2.suptitle(
-        f"Proxy-trajectory study — improvement over incumbent  |  {len(records)} trajectories  |  {args.csv}",
+        f"Proxy-trajectory study -- improvement over incumbent  |  {len(records)} trajectories  |  {args.csv}",
         fontsize=12
     )
 
@@ -533,35 +554,38 @@ def main():
     cmap_div = plt.cm.RdYlGn
     for idx in idx_sample:
         row = df.iloc[idx]
-        traj = [row[f"proxy_{k}"] for k in steps]
-        ax.plot(steps, traj, color=cmap_div(delta_norm[idx]), alpha=0.25, linewidth=0.8)
+        raw  = [row[f"proxy_{k}"] for k in plot_steps if not np.isnan(row[f"proxy_{k}"])]
+        xs   = [k for k in plot_steps if not np.isnan(row[f"proxy_{k}"])]
+        traj = list(np.maximum.accumulate(raw))   # running max: LS only accepts improvements
+        ax.plot(xs, traj, color=cmap_div(delta_norm[idx]), alpha=0.25, linewidth=0.8)
     sm2 = plt.cm.ScalarMappable(cmap=cmap_div, norm=plt.Normalize(delta_min, delta_max))
     sm2.set_array([])
     plt.colorbar(sm2, ax=ax, label="full_eval_delta")
     ax.set_xlabel("LS step")
     ax.set_ylabel("proxy score")
-    ax.set_title("Proxy trajectories (colour = Δ over incumbent)")
-    ax.set_xticks(steps)
+    ax.set_title("Proxy trajectories (colour = Delta over incumbent)")
+    ax.set_xticks(plot_steps)
 
     # Panel 2: r(proxy_k, full_eval_delta) per step
     ax = axes2[0, 1]
-    colors = ["steelblue" if (not np.isnan(r) and r >= 0) else "firebrick" for r in corrs_delta]
-    ax.bar(steps, corrs_delta, color=colors)
+    corrs_delta_plot = corrs_delta[:max_actual_step + 1]
+    colors = ["steelblue" if (not np.isnan(r) and r >= 0) else "firebrick" for r in corrs_delta_plot]
+    ax.bar(plot_steps, corrs_delta_plot, color=colors)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xlabel("LS step k")
     ax.set_ylabel("Pearson r(proxy_k, full_eval_delta)")
     ax.set_title("Does proxy_k predict improvement over incumbent?")
-    ax.set_xticks(steps)
-    lo = min(float(np.nanmin(corrs_delta)) - 0.05, -0.1)
-    ax.set_ylim(lo, max(float(np.nanmax(corrs_delta)) + 0.05, 0.2))
+    ax.set_xticks(plot_steps)
+    lo = min(float(np.nanmin(corrs_delta_plot)) - 0.05, -0.1)
+    ax.set_ylim(lo, max(float(np.nanmax(corrs_delta_plot)) + 0.05, 0.2))
 
     # Panel 3: proxy improvement (proxy_final - proxy_0) vs full_eval_delta
     ax = axes2[1, 0]
     ax.scatter(proxy_improvement[_mask_imp], delta[_mask_imp], alpha=0.3, s=8, color="mediumseagreen")
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
     ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("proxy improvement within LS  (proxy_final − proxy_0)")
-    ax.set_ylabel("full_eval_delta  (full_eval − incumbent)")
+    ax.set_xlabel("proxy improvement within LS  (proxy_final - proxy_0)")
+    ax.set_ylabel("full_eval_delta  (full_eval - incumbent)")
     ax.set_title(f"Proxy gain vs true gain  (r={r_imp_delta:+.3f})")
 
     # Panel 4: proxy_0 vs full_eval_delta
