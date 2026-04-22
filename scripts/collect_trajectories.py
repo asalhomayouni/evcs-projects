@@ -49,6 +49,7 @@ from evcs.greedy import reconstruct_u_dict_fast
 from evcs.methods import greedy_schedule_multi_from_variants
 from evcs.local_search import local_search_u_proxy
 from evcs.full_eval_grb import GRBEvaluator
+from evcs.ue_evaluator import UEEvaluator
 
 # =========================
 # ARGUMENTS
@@ -72,6 +73,14 @@ parser.add_argument("--ls-moves",       type=int,   default=12,
                     help="Local search moves per trajectory (default 12)")
 parser.add_argument("--no-plot",        action="store_true",
                     help="Skip matplotlib figures (headless / batch mode)")
+# --- full-eval oracle ---
+parser.add_argument("--full-eval",      type=str,   default="grb",
+                    choices=["grb", "ue"],
+                    help="Full evaluator: grb (default) or ue (UEEvaluator)")
+parser.add_argument("--ue-mu",          type=float, default=7.5,
+                    help="UE service rate per server (default 7.5, rho~0.78)")
+parser.add_argument("--ue-alpha-wait",  type=float, default=1.0,
+                    help="UE waiting-cost weight (default 1.0)")
 args = parser.parse_args()
 
 # Set backend BEFORE importing pyplot -- must happen here, at module level
@@ -211,10 +220,29 @@ def main():
     print(f"  N={N}  T={T}  D={D}  |A|={len(in_range)}")
 
     # -------------------------
-    # Gurobi evaluator (LP, fast)
+    # Full evaluator (GRB or UE)
     # -------------------------
-    print("Initialising GRBEvaluator …")
-    grb_eval = GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install)
+    use_ue = (args.full_eval == "ue")
+    if use_ue:
+        # UE uses a single demand vector (period 0); noopt_cost matches D so ranges align
+        d_ue = demand_TM[0]
+        print(f"Initialising UEEvaluator  (mu={args.ue_mu}, noopt={D} km, alpha_wait={args.ue_alpha_wait}) ...")
+        ue_eval = UEEvaluator(
+            N=N, d=d_ue, tau=distIJ, mu=args.ue_mu, s_max=max_chargers_per_site,
+            noopt_cost=float(D), alpha_wait=args.ue_alpha_wait, N_bp=50,
+        )
+        def full_eval_fn(U):
+            score, _ = ue_eval.evaluate(U, T=T, cumulative_install=cumulative_install)
+            return score, None
+        def dispose_eval():
+            ue_eval.dispose()
+    else:
+        print("Initialising GRBEvaluator ...")
+        grb_eval = GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install)
+        def full_eval_fn(U):
+            return grb_eval.evaluate(U)
+        def dispose_eval():
+            grb_eval.dispose()
 
     # -------------------------
     # Initial solution
@@ -228,7 +256,7 @@ def main():
         U_curr, demand_TM, J_i_list, distIJ, Q_cap, T, N, cumulative_install
     ))
 
-    best_full_score, _ = grb_eval.evaluate(U_curr)
+    best_full_score, _ = full_eval_fn(U_curr)
 
     print(f"  Initial proxy={proxy_curr:.4f}  full={best_full_score:.4f}")
     print(f"\nCollecting {N_TRAJ} trajectories (gate DISABLED) …\n")
@@ -304,7 +332,7 @@ def main():
                 running_best_proxy = p
                 U_ls_best = U_v
 
-        full_score, _ = grb_eval.evaluate(U_ls_best)
+        full_score, _ = full_eval_fn(U_ls_best)
 
         # 5) Update incumbent (optional -- keeps the ALNS "alive")
         if full_score >= best_full_score - 1e-4:
@@ -337,7 +365,7 @@ def main():
                 f"best_full={best_full_score:.4f}  elapsed={elapsed:.1f}s"
             )
 
-    grb_eval.dispose()
+    dispose_eval()
 
     elapsed_total = time.perf_counter() - t0
     print(f"\nDone. {len(records)} trajectories in {elapsed_total:.1f}s  ({it} DR iters)")
@@ -487,9 +515,10 @@ def main():
     # Figure 1 -- absolute quality (full_eval)
     # -----------------------------------------------------------------------
     fig1, axes = plt.subplots(2, 2, figsize=(14, 10))
+    eval_label = f"UE (mu={args.ue_mu}, noopt={D}km)" if use_ue else "GRB"
     fig1.suptitle(
-        f"Proxy-trajectory study -- absolute quality  |  {len(records)} trajectories  |  {args.csv}",
-        fontsize=12
+        f"Proxy-trajectory study -- absolute quality  |  {len(records)} trajectories  |  {args.csv}  |  full_eval={eval_label}",
+        fontsize=11
     )
 
     # Panel 1: trajectory bundles coloured by full_eval
@@ -545,8 +574,8 @@ def main():
     # -----------------------------------------------------------------------
     fig2, axes2 = plt.subplots(2, 2, figsize=(14, 10))
     fig2.suptitle(
-        f"Proxy-trajectory study -- improvement over incumbent  |  {len(records)} trajectories  |  {args.csv}",
-        fontsize=12
+        f"Proxy-trajectory study -- improvement over incumbent  |  {len(records)} trajectories  |  {args.csv}  |  full_eval={eval_label}",
+        fontsize=11
     )
 
     # Panel 1: trajectory bundles coloured by full_eval_delta
