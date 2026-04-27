@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from typing import Dict, Tuple
 
 import numpy as np
@@ -82,6 +83,8 @@ class UEEvaluator:
         N_bp: int = 100,
         lambda_scale: float = 1.0,
         eps: float = 1e-4,
+        max_range: float = None,
+        penalty_distance: float = 1.0,
     ):
         if not _GRB_AVAILABLE:
             raise ImportError("gurobipy is required for UEEvaluator")
@@ -93,6 +96,8 @@ class UEEvaluator:
         self.alpha_wait = float(alpha_wait)
         self.N_bp = int(N_bp)
         self.eps = float(eps)
+        self.max_range = max_range              # hard distance cutoff on assignments (km)
+        self.penalty_distance = float(penalty_distance)  # multiplier on tau in objective
 
         self._mu = np.full(N, float(mu)) if np.isscalar(mu) else np.asarray(mu, dtype=float)
         self._noopt = np.full(N, float(noopt_cost)) if np.isscalar(noopt_cost) else np.asarray(noopt_cost, dtype=float)
@@ -118,6 +123,18 @@ class UEEvaluator:
             s[j] = min(s[j], self.s_max)
         return s
 
+    def _build_reach(self, open_j):
+        """Return (reach_i, reach_j) dicts filtered by max_range."""
+        N = self.N
+        reach_i = {i: [] for i in range(N)}
+        reach_j = {j: [] for j in open_j}
+        for i in range(N):
+            for j in open_j:
+                if self.max_range is None or float(self.tau[i, j]) <= self.max_range:
+                    reach_i[i].append(j)
+                    reach_j[j].append(i)
+        return reach_i, reach_j
+
     def evaluate(
         self,
         U_dict: Dict,
@@ -133,44 +150,45 @@ class UEEvaluator:
         N = self.N
         I = range(N)
 
+        reach_i, reach_j = self._build_reach(open_j)
+        valid_ij = [(i, j) for i in I for j in reach_i[i]]
+
         gm = gp.Model(env=_get_env())
         gm.setParam("OutputFlag", 0)
 
-        y       = gm.addVars(N, N, lb=0.0, name="y")
+        y       = gm.addVars(valid_ij, lb=0.0, name="y") if valid_ij else {}
         y_noopt = gm.addVars(N, lb=0.0, name="yn")
-        lam     = gm.addVars(N, lb=0.0, name="lam")
-        phi     = gm.addVars(N, lb=0.0, name="phi")
-
-        for j in range(N):
-            if s_j[j] == 0:
-                for i in I:
-                    y[i, j].UB = 0.0
-                lam[j].UB = 0.0
-                phi[j].UB = 0.0
+        lam     = gm.addVars(open_j, lb=0.0, name="lam")
+        phi     = gm.addVars(open_j, lb=0.0, name="phi")
 
         gm.update()
 
-        # objective
+        # objective: distance (scaled) + no-option penalty + waiting cost
         gm.setObjective(
-            gp.quicksum(self.tau[i, j] * y[i, j] for i in I for j in open_j)
+            gp.quicksum(
+                self.penalty_distance * float(self.tau[i, j]) * y[i, j]
+                for (i, j) in valid_ij
+            )
             + gp.quicksum(self._noopt[i] * y_noopt[i] for i in I)
             + self.alpha_wait * gp.quicksum(phi[j] for j in open_j),
             GRB.MINIMIZE,
         )
 
-        # C4
+        # C4: demand balance (only in-range stations available)
         for i in I:
-            gm.addConstr(gp.quicksum(y[i, j] for j in open_j) + y_noopt[i] == self.d[i])
+            gm.addConstr(
+                gp.quicksum(y[i, j] for j in reach_i[i]) + y_noopt[i] == float(self.d[i])
+            )
 
-        # C6
+        # C6: station total flow
         for j in open_j:
-            gm.addConstr(lam[j] == gp.quicksum(y[i, j] for i in I))
+            gm.addConstr(lam[j] == gp.quicksum(y[i, j] for i in reach_j[j]))
 
-        # C7
+        # C7: capacity ceiling
         for j in open_j:
             gm.addConstr(lam[j] <= float(self._cap[j, s_j[j] - 1]))
 
-        # C8
+        # C8: piecewise-linear waiting cost
         for j in open_j:
             si = s_j[j] - 1
             for k in range(self.N_bp):

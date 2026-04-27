@@ -22,6 +22,7 @@ def local_search_u_proxy(
     Ij_int=None,
     top_k_choice=3,
     collect_visited: bool = False,
+    proxy_fn=None,
 ):
     """Proxy-guided local search on U-dict.
 
@@ -35,16 +36,14 @@ def local_search_u_proxy(
     """
     U_best = dict(U_start)
 
-    proxy_best = float(evaluate_u_numpy_greedy_binary(
-        U_best,
-        demand_TM=demand_TM,
-        J_i_list=J_i_list,
-        distIJ=distIJ,
-        Q_cap=float(Q_cap),
-        T=int(T),
-        N=int(N),
-        cumulative_install=cumulative_install,
-    ))
+    _eval = proxy_fn if proxy_fn is not None else (
+        lambda U: evaluate_u_numpy_greedy_binary(
+            U, demand_TM=demand_TM, J_i_list=J_i_list, distIJ=distIJ,
+            Q_cap=float(Q_cap), T=int(T), N=int(N), cumulative_install=cumulative_install,
+        )
+    )
+
+    proxy_best = float(_eval(U_best))
 
     visited = [dict(U_start)] if collect_visited else None
     # proxy_scores[0] = proxy of U_start; proxy_scores[k] = proxy after kth LS move
@@ -77,16 +76,7 @@ def local_search_u_proxy(
             top_k_choice=int(top_k_choice),
         )
 
-        proxy_try = float(evaluate_u_numpy_greedy_binary(
-            U_fill,
-            demand_TM=demand_TM,
-            J_i_list=J_i_list,
-            distIJ=distIJ,
-            Q_cap=float(Q_cap),
-            T=int(T),
-            N=int(N),
-            cumulative_install=cumulative_install,
-        ))
+        proxy_try = float(_eval(U_fill))
 
         if collect_visited:
             visited.append(dict(U_fill))

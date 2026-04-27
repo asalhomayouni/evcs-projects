@@ -3,6 +3,66 @@ import numpy as np
 from evcs.utils import _u_to_capacity_array
 
 
+def evaluate_u_ue_greedy(
+    U_dict,
+    demand_TM,
+    sorted_J_i,
+    station_cap,
+    noopt_max_range,
+    distIJ,
+    T,
+    N,
+    cumulative_install=True,
+):
+    """
+    UE-consistent greedy proxy. Port of Julia assign_demand_with_capacity.
+
+    Fractional assignment: demand splits across nearest open stations.
+    A demand unit goes to no-option if its nearest station is beyond
+    noopt_max_range OR all in-range stations are full.
+
+    sorted_J_i[i]: list of ALL j indices sorted by distIJ[i,j] ascending
+                   (precomputed once, filtered to dist <= noopt_max_range).
+    station_cap:   capacity per server (station_cap_per_server in Julia).
+    """
+    # Extract server counts (same logic as UEEvaluator._extract_servers)
+    s = np.zeros(N, dtype=int)
+    for j in range(N):
+        if T <= 1:
+            val = U_dict.get((j, 0), U_dict.get(j, 0))
+        elif cumulative_install:
+            val = sum(int(U_dict.get((j, t), 0)) for t in range(T))
+        else:
+            val = int(U_dict.get((j, T - 1), 0))
+        s[j] = int(val)
+
+    cap_rem = s.astype(float) * station_cap   # capacity vector
+
+    covered = 0.0
+    d_arr = demand_TM[0]                       # UE is single-period
+
+    for i in range(N):
+        d_i = float(d_arr[i])
+        if d_i <= 1e-12:
+            continue
+
+        remaining = d_i
+        for j in sorted_J_i[i]:               # pre-sorted, pre-filtered to <= noopt_max_range
+            if s[j] == 0:
+                continue
+            avail = cap_rem[j]
+            if avail <= 1e-12:
+                continue
+            flow = min(remaining, avail)
+            cap_rem[j] -= flow
+            remaining -= flow
+            covered += flow
+            if remaining <= 1e-12:
+                break
+
+    return float(covered)
+
+
 def evaluate_u_numpy_greedy(
     U_dict,
     demand_IT,

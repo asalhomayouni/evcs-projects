@@ -78,9 +78,20 @@ parser.add_argument("--full-eval",      type=str,   default="grb",
                     choices=["grb", "ue"],
                     help="Full evaluator: grb (default) or ue (UEEvaluator)")
 parser.add_argument("--ue-mu",          type=float, default=7.5,
-                    help="UE service rate per server (default 7.5, rho~0.78)")
-parser.add_argument("--ue-alpha-wait",  type=float, default=1.0,
-                    help="UE waiting-cost weight (default 1.0)")
+                    help="UE service rate per server (default 7.5)")
+parser.add_argument("--ue-alpha-wait",  type=float, default=10.0,
+                    help="UE waiting-cost weight alpha_wait (default 10.0)")
+parser.add_argument("--ue-noopt",       type=float, default=30.0,
+                    help="UE no-option LP penalty in km (default 30.0 — high enough that "
+                         "in-range demand always prefers a station)")
+parser.add_argument("--ue-max-range",   type=float, default=2.0,
+                    help="UE hard distance cutoff: demand can only be assigned to stations "
+                         "within this radius in km (default 2.0, matches D from build_arcs)")
+parser.add_argument("--ue-penalty-distance", type=float, default=5.0,
+                    help="UE scale factor on tau in objective (default 5.0 — amplifies "
+                         "distance sensitivity within the 2 km range window)")
+parser.add_argument("--ue-cap-per-server", type=float, default=4.0,
+                    help="UE capacity per server for proxy (default 4.0, matches Julia station_cap)")
 args = parser.parse_args()
 
 # Set backend BEFORE importing pyplot -- must happen here, at module level
@@ -177,10 +188,11 @@ def main():
     cumulative_install    = True
     policy                = "closest_priority"
 
-    # Output sub-directory: one folder per instance so parallel runs don't collide
+    # Output sub-directory: one folder per instance+eval so parallel runs don't collide
     instance_tag = Path(args.csv).stem
     if args.config_row is not None:
         instance_tag = f"row{args.config_row}_{instance_tag}"
+    instance_tag = f"{instance_tag}_{args.full_eval}"
     out_dir = RESULTS_DIR / instance_tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,18 +236,35 @@ def main():
     # -------------------------
     use_ue = (args.full_eval == "ue")
     if use_ue:
-        # UE uses a single demand vector (period 0); noopt_cost matches D so ranges align
+        ue_noopt   = args.ue_noopt           # no-option cost (km); default 30 = effectively infinite
+        ue_cap     = args.ue_cap_per_server  # capacity per server for proxy; default 4.0 (Julia default)
+        ue_mu      = ue_cap + 1e-4           # Erlang-C service rate = cap + eps (Julia convention)
+
         d_ue = demand_TM[0]
-        print(f"Initialising UEEvaluator  (mu={args.ue_mu}, noopt={D} km, alpha_wait={args.ue_alpha_wait}) ...")
+        ue_max_range      = args.ue_max_range
+        ue_penalty_dist   = args.ue_penalty_distance
+        print(
+            f"Initialising UEEvaluator  "
+            f"(mu={ue_mu:.4f}, noopt_cost={ue_noopt} km, alpha_wait={args.ue_alpha_wait}, "
+            f"max_range={ue_max_range} km, penalty_distance={ue_penalty_dist}, "
+            f"cap/server={ue_cap})"
+        )
         ue_eval = UEEvaluator(
-            N=N, d=d_ue, tau=distIJ, mu=args.ue_mu, s_max=max_chargers_per_site,
-            noopt_cost=float(D), alpha_wait=args.ue_alpha_wait, N_bp=50,
+            N=N, d=d_ue, tau=distIJ, mu=ue_mu, s_max=max_chargers_per_site,
+            noopt_cost=ue_noopt, alpha_wait=args.ue_alpha_wait, N_bp=50,
+            max_range=ue_max_range, penalty_distance=ue_penalty_dist,
         )
         def full_eval_fn(U):
             score, _ = ue_eval.evaluate(U, T=T, cumulative_install=cumulative_install)
             return score, None
         def dispose_eval():
             ue_eval.dispose()
+
+        # Binary greedy proxy (T=6, Q_cap=20) is the best available LS guide for UE full-eval.
+        # Scope-matching to T=1/Q=ue_cap saturates at the capacity ceiling (r drops to 0.37).
+        # T=6/Q=20 captures placement signal across all periods → r≈0.74 with UE.
+        print(f"UE full-eval proxy (LS guide): binary greedy T={T}, Q_cap={Q_cap}")
+        proxy_fn_override = None   # None → local_search_u_proxy uses binary greedy (default)
     else:
         print("Initialising GRBEvaluator ...")
         grb_eval = GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install)
@@ -243,6 +272,7 @@ def main():
             return grb_eval.evaluate(U)
         def dispose_eval():
             grb_eval.dispose()
+        proxy_fn_override = None   # use default GRB-based proxy inside LS
 
     # -------------------------
     # Initial solution
@@ -252,9 +282,12 @@ def main():
     U_curr = greedy_schedule_multi_from_variants(inst, P_T, D, seed=SEED)
     U_best = dict(U_curr)
 
-    proxy_curr = float(evaluate_u_numpy_greedy_binary(
-        U_curr, demand_TM, J_i_list, distIJ, Q_cap, T, N, cumulative_install
-    ))
+    if proxy_fn_override is not None:
+        proxy_curr = float(proxy_fn_override(U_curr))
+    else:
+        proxy_curr = float(evaluate_u_numpy_greedy_binary(
+            U_curr, demand_TM, J_i_list, distIJ, Q_cap, T, N, cumulative_install
+        ))
 
     best_full_score, _ = full_eval_fn(U_curr)
 
@@ -317,6 +350,7 @@ def main():
             Ij_int=Ij_int,
             top_k_choice=top_k_choice,
             collect_visited=True,
+            proxy_fn=proxy_fn_override,
         )
         # proxy_scores: list of length LS_MOVES+1
         #   proxy_scores[0]  = proxy(U_recon) before any LS move
@@ -515,7 +549,11 @@ def main():
     # Figure 1 -- absolute quality (full_eval)
     # -----------------------------------------------------------------------
     fig1, axes = plt.subplots(2, 2, figsize=(14, 10))
-    eval_label = f"UE (mu={args.ue_mu}, noopt={D}km)" if use_ue else "GRB"
+    eval_label = (
+        f"UE (mu={args.ue_mu}, noopt={args.ue_noopt}km, "
+        f"range={args.ue_max_range}km, α_w={args.ue_alpha_wait}, pd={args.ue_penalty_distance})"
+        if use_ue else "GRB"
+    )
     fig1.suptitle(
         f"Proxy-trajectory study -- absolute quality  |  {len(records)} trajectories  |  {args.csv}  |  full_eval={eval_label}",
         fontsize=11
