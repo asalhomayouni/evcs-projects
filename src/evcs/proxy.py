@@ -3,6 +3,66 @@ import numpy as np
 from evcs.utils import _u_to_capacity_array
 
 
+def compute_overflow_t0(U_dict, demand_t0, sorted_J_i, mu_ue, T, N):
+    """
+    Congestion overflow at period 0 under the UE capacity model.
+
+    Each demand node is attracted to its nearest open in-range station
+    (no capacity enforcement). The overflow is then:
+        overflow = Σ_j max(0, attracted_demand_j - s_j_cumulative * mu_ue)
+
+    This measures how much demand the greedy binary proxy "counts" but UE
+    would not serve (it sends the overflow to no-option or a farther station).
+    """
+    s = np.zeros(N, dtype=float)
+    for j in range(N):
+        for t in range(T):
+            s[j] += float(U_dict.get((j, t), 0))
+
+    cap_j = s * float(mu_ue)
+    attracted = np.zeros(N, dtype=float)
+
+    for i in range(N):
+        d_i = float(demand_t0[i])
+        if d_i <= 1e-12:
+            continue
+        for j in sorted_J_i[i]:       # pre-sorted ascending dist, filtered to max_range
+            if s[j] > 0:
+                attracted[j] += d_i
+                break                  # nearest-only: all of d_i goes to closest open station
+
+    return float(np.sum(np.maximum(0.0, attracted - cap_j)))
+
+
+def evaluate_u_congestion_proxy(
+    U_dict,
+    demand_TM,
+    J_i_list,
+    distIJ,
+    Q_cap,
+    T,
+    N,
+    cumulative_install,
+    sorted_J_i,
+    mu_ue,
+    lambda_cong,
+):
+    """
+    Congestion-aware proxy:
+        binary_proxy(U) - lambda_cong * overflow_t0(U)
+
+    binary_proxy uses T=6/Q_cap=20 (captures placement signal).
+    overflow_t0 uses period-0 demand with UE capacity (s_j * mu_ue),
+    penalising solutions whose stations would be over-subscribed in the UE.
+    """
+    bin_score = evaluate_u_numpy_greedy_binary(
+        U_dict, demand_TM=demand_TM, J_i_list=J_i_list, distIJ=distIJ,
+        Q_cap=Q_cap, T=T, N=N, cumulative_install=cumulative_install,
+    )
+    overflow = compute_overflow_t0(U_dict, demand_TM[0], sorted_J_i, mu_ue, T, N)
+    return float(bin_score - lambda_cong * overflow)
+
+
 def evaluate_u_ue_greedy(
     U_dict,
     demand_TM,
