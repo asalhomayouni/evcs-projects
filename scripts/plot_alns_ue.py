@@ -52,22 +52,27 @@ p.add_argument("--accept-eps",    type=float, default=0.0,
 p.add_argument("--time-limit",    type=float, default=float("inf"),
                help="Stop after this many seconds (default: no limit)")
 p.add_argument("--ue-alpha-wait",       type=float, default=10.0)
-p.add_argument("--ue-noopt",            type=float, default=30.0)
+p.add_argument("--ue-noopt",            type=float, default=10.0)
 p.add_argument("--ue-max-range",        type=float, default=2.0)
 p.add_argument("--ue-penalty-distance", type=float, default=5.0)
 p.add_argument("--ue-cap-per-server",   type=float, default=4.0)
 p.add_argument("--tag", default="",
                help="Optional suffix appended to output directory name")
+p.add_argument("--results-base", default="results/diagnostics/alns_ue",
+               help="Base output directory relative to project root (default: results/diagnostics/alns_ue)")
+p.add_argument("--traj-width",   type=float, default=9.0,
+               help="Trajectory plot figure width in inches (default 9)")
+p.add_argument("--marker-size",  type=int,   default=80,
+               help="Size of improvement dots on trajectory plot (default 80)")
 args = p.parse_args()
 
 DATA_DIR = PROJECT_ROOT / "data" / "input"
 
 instance_stem = Path(args.csv).stem
 dir_name = instance_stem + (f"_{args.tag}" if args.tag else "")
-OUT_DIR = PROJECT_ROOT / "results" / "diagnostics" / "alns_ue" / dir_name
+OUT_DIR = PROJECT_ROOT / args.results_base / dir_name
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-P_T           = [8] * args.T
 MAX_CHARGERS  = 6
 Q_CAP         = 20.0
 CUMULATIVE    = True
@@ -82,6 +87,12 @@ coords_km  = coords_deg * 111.0
 pop       = np.maximum(df_raw["Aggregated_Population"].to_numpy(float), 0.0)
 pop_share = pop / pop.sum()
 M         = coords_km.shape[0]
+
+# Budget scales with instance size.  Rule: total capacity = (N//30)*T*mu ≈ 0.8N
+# which keeps total capacity below total demand, making the LP UB informative.
+_period_budget = max(4, M // 30)
+P_T            = [_period_budget] * args.T
+
 base      = pop_share * M
 
 rng_inst  = np.random.default_rng(args.seed)
@@ -111,6 +122,7 @@ inst = {
 total_demand_t0 = float(demand_TM[0].sum())
 print(f"Instance : {args.csv}")
 print(f"N={M}  T={args.T}  D={args.D}km  |arcs|={len(in_range)}")
+print(f"Budget   : {_period_budget}/period  x{args.T} periods  = {sum(P_T)} total chargers")
 print(f"Total demand (t=0): {total_demand_t0:.2f}")
 
 # ── UEEvaluator ───────────────────────────────────────────────────────────────
@@ -128,6 +140,59 @@ ue_eval = UEEvaluator(
 def ue_fn(U):
     score, _ = ue_eval.evaluate(U, T=args.T, cumulative_install=CUMULATIVE)
     return float(score)
+
+# ── LP relaxation upper bound ─────────────────────────────────────────────────
+# Tight LP relaxation: relaxes server integrality but uses the exact Erlang-C
+# capacity ceiling from ue_eval._cap and bounds flow per station by both the
+# continuous server allocation AND the hard per-station max-server capacity.
+# Budget = sum(P_T), consistent with cumulative install at the final period.
+try:
+    import gurobipy as _gp
+    from gurobipy import GRB as _GRB
+    from evcs.model_grb import _get_env as _get_env_ub
+    _bgt  = float(sum(P_T))         # total charger budget (scales with N now)
+    _d0   = demand_TM[0]
+    # Use UEEvaluator's exact per-station max capacity (mu*s_max - eps)
+    _cap_max = np.array([float(ue_eval._cap[j, MAX_CHARGERS - 1]) for j in range(M)])
+
+    _ri_ub = {i: [] for i in range(M)}
+    _rj_ub = {j: [] for j in range(M)}
+    for (_i, _j) in in_range:
+        _ri_ub[_i].append(_j)
+        _rj_ub[_j].append(_i)
+
+    _gm = _gp.Model(env=_get_env_ub()); _gm.setParam("OutputFlag", 0)
+    _y   = _gm.addVars(in_range, lb=0.0)
+    _yn  = _gm.addVars(M,        lb=0.0)
+    _sv  = _gm.addVars(M,        lb=0.0, ub=float(MAX_CHARGERS))
+    _lam = _gm.addVars(M,        lb=0.0)
+    _gm.update()
+
+    _gm.setObjective(_gp.quicksum(_lam[j] for j in range(M)), _GRB.MAXIMIZE)
+
+    for _i in range(M):
+        _gm.addConstr(_gp.quicksum(_y[_i, _j] for _j in _ri_ub[_i]) + _yn[_i] == float(_d0[_i]))
+    for _j in range(M):
+        if _rj_ub[_j]:
+            _gm.addConstr(_lam[_j] == _gp.quicksum(_y[_i, _j] for _i in _rj_ub[_j]))
+            # Bound (1): continuous server allocation (main LP relaxation)
+            _gm.addConstr(_lam[_j] <= _sv[_j] * ue_mu)
+            # Bound (2): hard cap at exact max-server Erlang capacity
+            _gm.addConstr(_lam[_j] <= float(_cap_max[_j]))
+        else:
+            _gm.addConstr(_lam[_j] == 0.0)
+            _gm.addConstr(_sv[_j]  == 0.0)
+
+    # Global budget from new dynamic P_T
+    _gm.addConstr(_gp.quicksum(_sv[_j] for _j in range(M)) <= _bgt)
+
+    _gm.update(); _gm.optimize()
+    lp_ub = float(_gm.ObjVal) if _gm.SolCount > 0 else float(_d0.sum())
+    _gm.dispose()
+    print(f"LP relaxation upper bound: {lp_ub:.3f}  (budget={_bgt:.0f}  cap/station={_cap_max[0]:.2f})")
+except Exception as _exc:
+    lp_ub = None
+    print(f"LP UB skipped: {_exc}")
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 CMAP      = plt.cm.coolwarm
@@ -355,98 +420,82 @@ save_map(
 )
 print("Saved: best_solution.png")
 
-# ── Objective trajectory plot (main + zoomed inset) ──────────────────────────
-fig, ax = plt.subplots(figsize=(14, 6))
-fig.suptitle(
-    f"{args.csv}  N={M}  T={args.T}  D={args.D}km  |  "
-    f"iters={len(traj_iter)-1}  frac={args.frac_remove}  ls_moves={args.ls_moves}  "
-    f"eps={args.accept_eps}  elapsed={elapsed:.0f}s  |  "
-    f"UE: alpha_w={args.ue_alpha_wait}  range={args.ue_max_range}km  "
-    f"pd={args.ue_penalty_distance}  cap/s={args.ue_cap_per_server}",
-    fontsize=8.5,
-)
-
-# ── Main panel: full exploration trajectory ───────────────────────────────────
-ax.plot(traj_iter, traj_score_curr, color="steelblue", linewidth=0.8, alpha=0.45,
-        linestyle="-", label="Current UE (U_curr)", zorder=2)
-ax.plot(traj_iter, traj_score_best, color="crimson", linewidth=2.5,
-        label="Best UE (U_best)", zorder=3)
-
-for inc_it, inc_score, _ in incumbents:
-    ax.axvline(inc_it, color="crimson", linewidth=0.8, linestyle=":", alpha=0.4)
-    ax.scatter([inc_it], [inc_score], s=50, color="crimson", zorder=5)
-
-ax.set_xlabel("ALNS iteration", fontsize=9)
-ax.set_ylabel("UE score", fontsize=9)
-ax.set_title(
-    "Objective trajectory — blue = current solution (exploration), "
-    "red = best-ever  |  inset: best-score staircase zoomed",
-    fontsize=9,
-)
-ax.legend(fontsize=8, loc="lower right")
-ax.set_xlim(0, traj_iter[-1])
-
-# ── Zoomed inset: best-score staircase, right side ───────────────────────────
-axins = ax.inset_axes([0.57, 0.06, 0.41, 0.88])
-
-# Only the staircase — no noisy current-solution line
-axins.plot(traj_iter, traj_score_best, color="crimson", linewidth=2.2, zorder=3)
-
+# ── Objective trajectory plot ─────────────────────────────────────────────────
 best_scores = [inc[1] for inc in incumbents]
-y_margin = 0.12
-y_lo = min(best_scores) - y_margin
-y_hi = max(best_scores) + y_margin
-axins.set_ylim(y_lo, y_hi)
-axins.set_xlim(0, traj_iter[-1])
+n_jumps     = len(incumbents) - 1
 
-# Vertical drop lines + numbered dots at each step
-for k, (inc_it, inc_score, inc_mode) in enumerate(incumbents):
-    axins.axvline(inc_it, color="crimson", linewidth=0.8, linestyle=":", alpha=0.4)
+# Conference-quality style
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.size":         11,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.linewidth":    0.9,
+    "xtick.direction":   "in",
+    "ytick.direction":   "in",
+    "xtick.major.size":  4,
+    "ytick.major.size":  4,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "grid.alpha":        0.25,
+    "grid.linestyle":    "--",
+    "grid.linewidth":    0.6,
+})
 
-axins.scatter(
-    [inc[0] for inc in incumbents],
-    [inc[1] for inc in incumbents],
-    s=55, color="crimson", zorder=5,
+fig, ax = plt.subplots(figsize=(args.traj_width, 6))
+ax.grid(axis="y", alpha=0.20, linewidth=0.5)
+
+# ── Best-score staircase ──────────────────────────────────────────────────────
+ax.plot(traj_iter, traj_score_best,
+        color="#C0392B", linewidth=2.2, zorder=3,
+        solid_capstyle="round", label="ALNS best")
+
+# ── Improvement dots (no drop lines, no annotations) ─────────────────────────
+imp_iters  = [inc[0] for inc in incumbents[1:]]
+imp_scores = [inc[1] for inc in incumbents[1:]]
+ax.scatter(imp_iters, imp_scores,
+           color="#C0392B", s=args.marker_size, zorder=5,
+           edgecolors="white", linewidths=1.0)
+
+# ── Greedy baseline ───────────────────────────────────────────────────────────
+ax.axhline(
+    best_scores[0],
+    color="#2471A3", linewidth=1.4, linestyle="--", alpha=0.85, zorder=2,
+    label=f"Greedy  {best_scores[0]:.1f}",
 )
 
-# Alternate #labels above/below each dot so they never overlap
-for k, (inc_it, inc_score, _) in enumerate(incumbents):
-    va  = "bottom" if k % 2 == 0 else "top"
-    dy  =  0.025   if k % 2 == 0 else -0.025
-    axins.text(inc_it, inc_score + dy, f"#{k}",
-               fontsize=7.5, color="crimson", ha="center", va=va, fontweight="bold")
+# ── LP relaxation upper bound ─────────────────────────────────────────────────
+_y_lo   = best_scores[0]
+_ref_hi = lp_ub if lp_ub is not None else best_scores[-1]
+_jspan  = max(_ref_hi - _y_lo, 1e-6)
+_pad    = max(_jspan * 0.06, 0.05)
+_ylim_lo = _y_lo - _pad
+_ylim_hi = _ref_hi + _pad
 
-# Monospace detail table in the lower-left corner of the inset
-rows = ["#   iter   score    delta       mode"]
-rows.append("-" * 38)
-for k, (inc_it, inc_score, inc_mode) in enumerate(incumbents):
-    delta_str = f"+{inc_score - incumbents[k-1][1]:.3f}" if k > 0 else "baseline"
-    rows.append(f"{k}  {inc_it:>5d}  {inc_score:.3f}  {delta_str:<10}  {inc_mode}")
+if lp_ub is not None:
+    ax.axhline(
+        lp_ub,
+        color="#1E8449", linewidth=1.8, linestyle=(0, (5, 3)),
+        alpha=1.0, zorder=4,
+        label=f"LP UB  {lp_ub:.1f}",
+    )
 
-axins.text(
-    0.02, 0.02, "\n".join(rows),
-    transform=axins.transAxes,
-    fontsize=5.8, color="crimson", family="monospace",
-    va="bottom", ha="left",
-    bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
-              alpha=0.88, edgecolor="crimson", lw=0.6),
+ax.set_xlabel("Iteration", fontsize=11)
+ax.set_ylabel("UE score", fontsize=11)
+ax.set_xlim(0, traj_iter[-1])
+ax.set_ylim(_ylim_lo, _ylim_hi)
+
+ax.set_title(
+    f"{Path(args.csv).stem}   $N={M}$,  $T={args.T}$,  budget/period $={_period_budget}$",
+    fontsize=11, pad=8,
 )
-
-axins.set_xlabel("iteration", fontsize=7)
-axins.set_ylabel("best UE", fontsize=7)
-axins.tick_params(labelsize=6.5)
-axins.set_title("Best-score staircase (zoomed)", fontsize=7.5, pad=3)
-axins.yaxis.set_major_formatter(plt.matplotlib.ticker.FormatStrFormatter("%.3f"))
-
-# Shaded band on the main panel showing the inset's y-range
-ax.axhspan(y_lo, y_hi, alpha=0.07, color="crimson", zorder=0)
-ax.annotate("inset region", xy=(traj_iter[-1] * 0.28, (y_lo + y_hi) / 2),
-            fontsize=7.5, color="crimson", alpha=0.6, va="center")
+ax.legend(fontsize=9, frameon=False, loc="lower right")
 
 fig.tight_layout()
 traj_fname = "alns_trajectory.png"
-fig.savefig(OUT_DIR / traj_fname, dpi=150, bbox_inches="tight")
+fig.savefig(OUT_DIR / traj_fname, dpi=180, bbox_inches="tight")
 plt.close(fig)
+plt.rcdefaults()
 print(f"Saved: {traj_fname}")
 
 # ── Incumbent summary ─────────────────────────────────────────────────────────
