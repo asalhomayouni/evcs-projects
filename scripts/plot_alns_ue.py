@@ -64,6 +64,12 @@ p.add_argument("--traj-width",   type=float, default=9.0,
                help="Trajectory plot figure width in inches (default 9)")
 p.add_argument("--marker-size",  type=int,   default=80,
                help="Size of improvement dots on trajectory plot (default 80)")
+p.add_argument("--mip-time-limit", type=float, default=300.0,
+               help="Time limit in seconds for the MIP upper-bound solve (0 to skip, default 300)")
+p.add_argument("--mip-gap",      type=float, default=0.005,
+               help="MIP gap threshold for early termination (default 0.005 = 0.5%%)")
+p.add_argument("--ue-mip-best",  type=float, default=None,
+               help="Known UE-MIP best feasible solution — drawn as reference line on trajectory plot")
 args = p.parse_args()
 
 DATA_DIR = PROJECT_ROOT / "data" / "input"
@@ -193,6 +199,77 @@ try:
 except Exception as _exc:
     lp_ub = None
     print(f"LP UB skipped: {_exc}")
+
+# ── MIP upper bound (integer server allocation) ───────────────────────────────
+mip_bound     = None   # Gurobi dual bound (valid UB even if not optimal)
+mip_incumbent = None   # best MIP feasible solution found
+mip_gap_pct   = None
+
+if args.mip_time_limit > 0:
+    try:
+        import gurobipy as _gp2
+        from gurobipy import GRB as _GRB2
+        from evcs.model_grb import _get_env as _get_env_mip
+        _bgt2     = float(sum(P_T))
+        _d0_mip   = demand_TM[0]
+        _cap_mip  = np.array([float(ue_eval._cap[j, MAX_CHARGERS - 1]) for j in range(M)])
+
+        _ri_mip = {i: [] for i in range(M)}
+        _rj_mip = {j: [] for j in range(M)}
+        for (_i, _j) in in_range:
+            _ri_mip[_i].append(_j)
+            _rj_mip[_j].append(_i)
+
+        print(f"\nRunning MIP  (time_limit={args.mip_time_limit:.0f}s  mip_gap={args.mip_gap:.3f}) ...")
+        _gm2 = _gp2.Model(env=_get_env_mip())
+        _gm2.setParam("OutputFlag", 1)
+        _gm2.setParam("TimeLimit",  float(args.mip_time_limit))
+        _gm2.setParam("MIPGap",     float(args.mip_gap))
+        _gm2.setParam("Threads",    4)
+
+        _y2   = _gm2.addVars(in_range, lb=0.0)
+        _yn2  = _gm2.addVars(M,        lb=0.0)
+        _sv2  = _gm2.addVars(M, vtype=_GRB2.INTEGER, lb=0, ub=int(MAX_CHARGERS))
+        _lam2 = _gm2.addVars(M, lb=0.0)
+        _gm2.update()
+
+        _gm2.setObjective(_gp2.quicksum(_lam2[j] for j in range(M)), _GRB2.MAXIMIZE)
+
+        for _i in range(M):
+            _gm2.addConstr(
+                _gp2.quicksum(_y2[_i, _j] for _j in _ri_mip[_i]) + _yn2[_i]
+                == float(_d0_mip[_i])
+            )
+        for _j in range(M):
+            if _rj_mip[_j]:
+                _gm2.addConstr(_lam2[_j] == _gp2.quicksum(_y2[_i, _j] for _i in _rj_mip[_j]))
+                _gm2.addConstr(_lam2[_j] <= _sv2[_j] * ue_mu)
+                _gm2.addConstr(_lam2[_j] <= float(_cap_mip[_j]))
+            else:
+                _gm2.addConstr(_lam2[_j] == 0.0)
+                _gm2.addConstr(_sv2[_j]  == 0.0)
+
+        _gm2.addConstr(_gp2.quicksum(_sv2[_j] for _j in range(M)) <= _bgt2)
+        _gm2.update()
+        _gm2.optimize()
+
+        if _gm2.SolCount > 0:
+            mip_incumbent = float(_gm2.ObjVal)
+        try:
+            mip_bound = float(_gm2.ObjBound)
+        except Exception:
+            pass
+        if mip_incumbent is not None and mip_bound is not None and mip_bound > 1e-9:
+            mip_gap_pct = 100.0 * (mip_bound - mip_incumbent) / mip_bound
+        _gm2.dispose()
+        print(
+            f"MIP done:  incumbent={mip_incumbent}  "
+            f"bound={mip_bound}  "
+            f"gap={mip_gap_pct:.2f}%" if mip_gap_pct is not None
+            else f"MIP done:  incumbent={mip_incumbent}  bound={mip_bound}"
+        )
+    except Exception as _exc2:
+        print(f"MIP solve skipped: {_exc2}")
 
 # ── Plotting helpers ──────────────────────────────────────────────────────────
 CMAP      = plt.cm.coolwarm
@@ -464,20 +541,34 @@ ax.axhline(
     label=f"Greedy  {best_scores[0]:.1f}",
 )
 
-# ── LP relaxation upper bound ─────────────────────────────────────────────────
+# ── Reference line: UE-MIP Best (optional) ───────────────────────────────────
+_ue_mip_best = args.ue_mip_best   # None unless --ue-mip-best is passed
+
+_ref_hi = _ue_mip_best if _ue_mip_best is not None else best_scores[-1]
 _y_lo   = best_scores[0]
-_ref_hi = lp_ub if lp_ub is not None else best_scores[-1]
 _jspan  = max(_ref_hi - _y_lo, 1e-6)
 _pad    = max(_jspan * 0.06, 0.05)
-_ylim_lo = _y_lo - _pad
+_ylim_lo = _y_lo  - _pad
 _ylim_hi = _ref_hi + _pad
 
-if lp_ub is not None:
+if _ue_mip_best is not None:
     ax.axhline(
-        lp_ub,
-        color="#1E8449", linewidth=1.8, linestyle=(0, (5, 3)),
+        _ue_mip_best,
+        color="#117A65", linewidth=2.0, linestyle=":",
         alpha=1.0, zorder=4,
-        label=f"LP UB  {lp_ub:.1f}",
+        label=f"UE-MIP Best  {_ue_mip_best:.1f}",
+    )
+
+# Annotate ALNS gap vs UE-MIP Best
+_alns_final = score_best
+if _ue_mip_best is not None and _ue_mip_best > 1e-9:
+    _gap_alns = 100.0 * (_ue_mip_best - _alns_final) / _ue_mip_best
+    _gap_sign = f"{_gap_alns:+.1f}%"
+    ax.annotate(
+        f"ALNS gap vs UE-MIP Best: {_gap_sign}",
+        xy=(traj_iter[-1], _alns_final),
+        xytext=(-8, 6), textcoords="offset points",
+        ha="right", va="bottom", fontsize=8.5, color="#7B241C",
     )
 
 ax.set_xlabel("Iteration", fontsize=11)
@@ -505,6 +596,15 @@ print(f"  {'-'*3} {'-'*6}  {'-'*10}  {'-'*16}")
 for k, (inc_it, inc_score, inc_mode) in enumerate(incumbents):
     delta = f"+{inc_score - incumbents[k-1][1]:.3f}" if k > 0 else "baseline"
     print(f"  {k:<4} {inc_it:>6}  {inc_score:>10.3f}  {inc_mode:<16}  ({delta})")
+
+if mip_bound is not None or mip_incumbent is not None:
+    print(f"\nMIP results:")
+    if mip_bound     is not None: print(f"  Bound      : {mip_bound:.3f}")
+    if mip_incumbent is not None: print(f"  Incumbent  : {mip_incumbent:.3f}")
+    if mip_gap_pct   is not None: print(f"  MIP gap    : {mip_gap_pct:.2f}%")
+    if mip_bound is not None:
+        _alns_gap = 100.0 * (mip_bound - score_best) / mip_bound
+        print(f"  ALNS gap vs MIP bound: {_alns_gap:.2f}%")
 
 print(f"\nAll plots -> {OUT_DIR}")
 ue_eval.dispose()
