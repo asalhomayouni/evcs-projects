@@ -76,7 +76,7 @@ def build_base_model(
     else:
         m.x = Var(m.J, within=Binary)
 
-    m.y = Var(m.Arcs, within=Binary)
+    m.y = Var(m.Arcs, within=NonNegativeReals, bounds=(0, 1))
 
     # --- Objective ---
     def obj_rule(m):
@@ -180,12 +180,12 @@ def build_multi_period_model(
     # --- Decision variables ---
     if not allow_multi_charger:
         m.x = Var(m.J, m.T, within=Binary)
-        m.y = Var(m.Arcs, m.T, within=Binary)
+        m.y = Var(m.Arcs, m.T, within=NonNegativeReals, bounds=(0, 1))
     else:
         m.u = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, site_ub))
         m.x = Var(m.J, m.T, within=NonNegativeIntegers, bounds=(0, site_ub))
         m.z = Var(m.J, m.T, within=Binary)
-        m.y = Var(m.Arcs, m.T, within=Binary)
+        m.y = Var(m.Arcs, m.T, within=NonNegativeReals, bounds=(0, 1))
 
         def open_charger_link(m, j, t):
             return m.x[j, t] >= m.z[j, t]

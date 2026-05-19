@@ -8,6 +8,12 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 from pyomo.environ import ConstraintList, Objective, maximize, value
 
+try:
+    from evcs.flow_solver import solve_so_assignment_lp, solve_max_coverage_flow
+    _FLOW_SOLVER = True
+except ImportError:
+    _FLOW_SOLVER = False
+
 
 # =========================================================
 # Model mode detection
@@ -493,6 +499,45 @@ def apply_method_multi(m, method_name, distIJ, in_range, Ji, Ij, farther_of, ver
 # =========================================================
 # Greedy assignment (single + multi)
 # =========================================================
+def _assign_so_lp_multi(m, distIJ, lambda_dist: float = 0.1, cumulative_install: bool = True):
+    """
+    Exact SO assignment for all time periods using the scipy LP solver.
+
+    For each period t independently:
+      - extract open-station capacities cap[j] = Q * x[j,t]
+      - solve solve_so_assignment_lp(...) over arcs to open stations
+      - round LP solution to 0/1 (solution is integral when a[i] are uniform;
+        for varying a[i] the LP is still the correct relaxation and the
+        threshold-0.5 rounding is consistent with how evaluators read y)
+    """
+    sync_solution_state(m, cumulative_install=cumulative_install)
+
+    I_list = [int(i) for i in m.I]
+    J_list = [int(j) for j in m.J]
+    T_list = [int(t) for t in m.T]
+    Q = float(value(m.Q))
+    dij = _distance_getter(distIJ)
+
+    for (i, j) in m.Arcs:
+        for tt in T_list:
+            m.y[int(i), int(j), tt].value = 0
+
+    for tt in T_list:
+        a_t = {ii: float(value(m.a[ii, tt])) for ii in I_list}
+        cap_t = {jj: Q * float(charger_count_t(m, jj, tt)) for jj in J_list}
+
+        arcs_t = [(int(i), int(j)) for (i, j) in m.Arcs if cap_t.get(int(j), 0.0) > 1e-9]
+        if not arcs_t:
+            continue
+
+        y_vals = solve_so_assignment_lp(arcs_t, a_t, cap_t, dij, lambda_dist=lambda_dist)
+
+        for (i, j), yv in y_vals.items():
+            m.y[i, j, tt].value = int(yv >= 0.5)
+
+    return m
+
+
 def reassign_y_greedy(m, distIJ, Ji, method_name: str):
     """
     Single-period greedy assignment:
@@ -542,19 +587,22 @@ def reassign_y_greedy(m, distIJ, Ji, method_name: str):
 
 def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install: bool = True):
     """
-    Multi-period greedy assignment (BINARY y).
-    - y[i,j,t] in {0,1}
-    - each i at time t assigned to at most one open site
-    - capacity uses YOUR model notion: Q * charger_count_t(m,j,t)
-    - open uses YOUR model notion: open_value_t(m,j,t)
+    Multi-period assignment.  For system_optimum, delegates to the exact
+    scipy LP solver (_assign_so_lp_multi) when available; all other policies
+    use the greedy heuristic below.
 
     Policies supported (case-insensitive):
       - closest_only
       - closest_priority
-      - system_optimum
+      - system_optimum  → exact LP (scipy) or greedy fallback
       - uniform
       - default: best-fit (tight fill)
     """
+    name = str(method_name).lower().strip()
+
+    if name == "system_optimum" and _FLOW_SOLVER:
+        return _assign_so_lp_multi(m, distIJ, lambda_dist=0.1, cumulative_install=cumulative_install)
+
     # make sure x/z etc are consistent with u (and cumulative_install)
     sync_solution_state(m, cumulative_install=cumulative_install)
 
@@ -621,8 +669,8 @@ def reassign_y_greedy_multi(m, distIJ, Ji, method_name: str, cumulative_install:
                 chosen = min(feasible, key=lambda jj: (dij(ii, jj), cap_rem[jj] - a[ii]))
 
             elif name == "system_optimum":
-                # cost proxy: demand * distance, then tighter fill
-                chosen = min(feasible, key=lambda jj: (a[ii] * dij(ii, jj), cap_rem[jj] - a[ii]))
+                # fallback greedy: minimise marginal SO cost = λ·dist − a[i]
+                chosen = min(feasible, key=lambda jj: (0.1 * dij(ii, jj) - a[ii], cap_rem[jj] - a[ii]))
 
             elif name == "uniform":
                 chosen = random.choice(feasible)

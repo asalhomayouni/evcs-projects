@@ -444,7 +444,8 @@ def run_DR_multi(
     # One Gurobi model built here, reused for every full evaluation in the loop.
     # dispose() is called once at the end — one license checkout per DR run.
     grb_eval = (
-        GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install)
+        GRBEvaluator(M, N, T, in_range, demand_TM, Q_cap, cumulative_install,
+                     method_name=policy, distIJ=distIJ)
         if use_grb_eval else None
     )
 

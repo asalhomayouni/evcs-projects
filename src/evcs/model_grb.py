@@ -199,7 +199,7 @@ def build_base_model_grb(M, N, in_range, Ji, Ij, demand_I, Q, P,
     else:
         for j in range(N):
             x[j] = gm.addVar(vtype=GRB.BINARY, name=f"x_{j}")
-    y = {(i,j): gm.addVar(vtype=GRB.BINARY, name=f"y_{i}_{j}") for i,j in arcs}
+    y = {(i,j): gm.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"y_{i}_{j}") for i,j in arcs}
     gm.update()
 
     gm.setObjective(gp.quicksum(a[i]*y[i,j] for i,j in arcs), GRB.MAXIMIZE)
@@ -250,7 +250,7 @@ def build_multi_period_model_grb(M, N, T, in_range, Ji, Ij, demand_IT, Q, P_T,
         for j in range(N):
             for t in range(T): x[j,t] = gm.addVar(vtype=GRB.BINARY, name=f"x_{j}_{t}")
         for i,j in arcs:
-            for t in range(T): y[i,j,t] = gm.addVar(vtype=GRB.BINARY, name=f"y_{i}_{j}_{t}")
+            for t in range(T): y[i,j,t] = gm.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"y_{i}_{j}_{t}")
     else:
         for j in range(N):
             for t in range(T):
@@ -258,7 +258,7 @@ def build_multi_period_model_grb(M, N, T, in_range, Ji, Ij, demand_IT, Q, P_T,
                 x[j,t] = gm.addVar(vtype=GRB.INTEGER, lb=0, ub=ub, name=f"x_{j}_{t}")
                 z[j,t] = gm.addVar(vtype=GRB.BINARY, name=f"z_{j}_{t}")
         for i,j in arcs:
-            for t in range(T): y[i,j,t] = gm.addVar(vtype=GRB.BINARY, name=f"y_{i}_{j}_{t}")
+            for t in range(T): y[i,j,t] = gm.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"y_{i}_{j}_{t}")
     gm.update()
 
     gm.setObjective(gp.quicksum(a[i,t]*y[i,j,t] for i,j in arcs for t in range(T)), GRB.MAXIMIZE)

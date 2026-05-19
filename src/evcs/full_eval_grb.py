@@ -73,7 +73,8 @@ def reassign_y_greedy_multi_pure(x_jt, z_jt, Q, demand_TM, arcs, M, N, T, distIJ
             elif name == "closest_priority":
                 chosen = min(feasible, key=lambda j: (_dij(distIJ, ii, j), cap_rem[j] - a[ii]))
             elif name == "system_optimum":
-                chosen = min(feasible, key=lambda j: (a[ii] * _dij(distIJ, ii, j), cap_rem[j] - a[ii]))
+                # minimise marginal SO cost: λ·dist − a[i]  (fallback greedy only)
+                chosen = min(feasible, key=lambda j: (0.1 * _dij(distIJ, ii, j) - a[ii], cap_rem[j] - a[ii]))
             elif name == "uniform":
                 chosen = random.choice(feasible)
             else:
@@ -139,7 +140,8 @@ class GRBEvaluator:
         # dispose() called automatically on __exit__
     """
 
-    def __init__(self, M, N, T, arcs, demand_TM, Q, cumulative_install=True):
+    def __init__(self, M, N, T, arcs, demand_TM, Q, cumulative_install=True,
+                 method_name="coverage", distIJ=None, lambda_dist=0.1):
         if not _GRB_AVAILABLE:
             raise ImportError("gurobipy is required for GRBEvaluator")
 
@@ -172,11 +174,20 @@ class GRBEvaluator:
         y = gm.addVars(arc_t_keys, lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="y")
         gm.update()
 
-        # objective: maximise covered demand
-        gm.setObjective(
-            gp.quicksum(self._a[i, t] * y[i, j, t] for (i, j, t) in arc_t_keys),
-            GRB.MAXIMIZE,
-        )
+        # objective: maximise covered demand (SO adds distance penalty)
+        if str(method_name).lower() == "system_optimum" and distIJ is not None:
+            gm.setObjective(
+                gp.quicksum(
+                    (self._a[i, t] - lambda_dist * _dij(distIJ, i, j)) * y[i, j, t]
+                    for (i, j, t) in arc_t_keys
+                ),
+                GRB.MAXIMIZE,
+            )
+        else:
+            gm.setObjective(
+                gp.quicksum(self._a[i, t] * y[i, j, t] for (i, j, t) in arc_t_keys),
+                GRB.MAXIMIZE,
+            )
 
         # each demand node served by at most one site per period
         for i in range(M):
