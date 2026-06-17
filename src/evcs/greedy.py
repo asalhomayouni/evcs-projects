@@ -158,9 +158,22 @@ def reconstruct_u_dict_fast(
     rng=None,
     cumulative_install: bool = True,
     top_k_choice: int = 3,
-
+    # ── partial-delta cache arguments (optional) ──────────────────────────────
+    delta_cache: dict | None = None,   # (j, t) -> float, updated in-place
+    refresh_ratio: float = 1.0,        # R: fraction of non-destroyed sites to refresh
+    destroyed_js: set | None = None,   # sites whose capacity changed (always refresh)
+    Ji: dict | None = None,            # demand node i -> [sites j covering i]
 ):
+    """
+    Greedy reconstruction.  When delta_cache is provided the function reuses
+    marginal-gain scores from the previous D&R iteration and only recomputes
+    scores for (a) the destroyed region and (b) a random R% of other sites.
+    After each greedy placement the cache is updated locally via Ji so that
+    subsequent picks within the same reconstruction see fresh values.
 
+    delta_cache is modified **in-place**; pass an empty dict {} on the first
+    call and the same dict on every subsequent call.
+    """
     import numpy as np
 
     if rng is None:
@@ -169,104 +182,114 @@ def reconstruct_u_dict_fast(
     # Copy (do not mutate caller)
     U = dict(U_partial)
 
-    # Robustly infer J set:
-    # Prefer Ij_int keys (all candidate sites); fallback to keys in U
     if Ij_int and len(Ij_int) > 0:
         Js = sorted({int(j) for j in Ij_int.keys()})
     else:
         Js = sorted({int(j) for (j, t) in U.keys()})
 
-    T = len(P_T)
+    T   = len(P_T)
+    Q   = float(Q)
+    U_cap = int(U_cap)
+    proxy_total = 0.0
+    use_cache   = delta_cache is not None
 
-    def u_get(j, t):
-        return int(U.get((int(j), int(t)), 0))
-
-    def u_set(j, t, v):
-        U[(int(j), int(t))] = int(v)
+    def u_get(j, t): return int(U.get((int(j), int(t)), 0))
+    def u_set(j, t, v): U[(int(j), int(t))] = int(v)
 
     def x_now(j, t):
-        """Chargers at site j in period t (cumulative or not)."""
-        j = int(j)
-        t = int(t)
+        j, t = int(j), int(t)
         if cumulative_install:
-            # sum u[j,0..t]
-            s = 0
-            for tt in range(t + 1):
-                s += u_get(j, tt)
-            return s
-        return u_get(j, t)
+            return sum(int(U.get((j, tt), 0)) for tt in range(t + 1))
+        return int(U.get((j, t), 0))
 
-    proxy_total = 0.0
-    Q = float(Q)
-    U_cap = int(U_cap)
+    # Build Ji (inverse index) once if caching is on and it wasn't supplied
+    if use_cache and Ji is None:
+        Ji = {}
+        for j_key, nodes in Ij_int.items():
+            for i in nodes:
+                Ji.setdefault(int(i), []).append(int(j_key))
+
+    # ── Build refresh set for this reconstruction call ────────────────────────
+    # Sites in refresh_set get their delta recomputed from the uncovered mask.
+    # All other sites use the cached value and are updated locally via Ji.
+    if use_cache:
+        refresh_set = set(int(j) for j in (destroyed_js or []))
+        n_rand = max(0, int(refresh_ratio * len(Js)))
+        if n_rand >= len(Js):
+            refresh_set = set(Js)           # full refresh = baseline behaviour
+        elif n_rand > 0:
+            rand_js = rng.choice(Js, size=n_rand, replace=False)
+            refresh_set.update(int(j) for j in rand_js)
+    else:
+        refresh_set = None                  # None means "refresh everything"
 
     for t in range(T):
-        # Period t: how many already installed?
-        already = 0
-        for j in Js:
-            already += u_get(j, t)
+        # Precompute x_now for all sites (avoids O(T) inner calls in hot loop)
+        xcap = {j: x_now(j, t) for j in Js}
 
+        already = sum(u_get(j, t) for j in Js)
         missing = max(0, int(P_T[t]) - int(already))
         if missing <= 0:
             continue
 
-        # uncovered demand mask (bool list is faster than set in tight loops)
         M = len(demand_IT[t])
         uncovered = [True] * M
 
-        for _ in range(missing):
-            topk = []  # list of (score, j)
+        # After step 0 we switch to Ji-local updates; track with a mutable set
+        needs_fresh = set(refresh_set) if use_cache else None
 
-            # choose site by marginal uncovered demand (random among top-k)
+        for step in range(missing):
+            topk = []
+
             for j in Js:
-                if x_now(j, t) >= U_cap:
+                jj = int(j)
+                if xcap[jj] >= U_cap:
+                    if use_cache:
+                        delta_cache[(jj, t)] = 0.0
                     continue
 
-                s = 0.0
-                neigh = Ij_int.get(int(j), [])
-                for i in neigh:
-                    ii = int(i)
-                    if uncovered[ii]:
-                        s += float(demand_IT[t, ii])
+                if (not use_cache) or jj in needs_fresh or (jj, t) not in delta_cache:
+                    # ── fresh computation ─────────────────────────────────────
+                    s = 0.0
+                    for i in Ij_int.get(jj, []):
+                        if uncovered[int(i)]:
+                            s += float(demand_IT[t, int(i)])
+                    if use_cache:
+                        delta_cache[(jj, t)] = s
+                else:
+                    # ── use cached (locally-updated) score ────────────────────
+                    s = max(0.0, delta_cache[(jj, t)])
 
-                if s <= 1e-12:
-                    continue
+                if s > 1e-12:
+                    topk.append((float(s), jj))
 
-                topk.append((float(s), int(j)))
+            # After the first greedy step, rely on Ji local updates only
+            if step == 0 and needs_fresh is not None:
+                needs_fresh = set()
 
             if not topk:
                 break
 
-            # keep only top-k by score (k small, this is fast enough)
-            k = int(top_k_choice) if top_k_choice is not None else 1
-            k = max(1, k)
+            k = max(1, int(top_k_choice) if top_k_choice is not None else 1)
             topk.sort(key=lambda x: x[0], reverse=True)
             topk = topk[:k]
 
-            # random tie-break among top-k (weighted by score optional; here: uniform)
-            p_elite = 0.85  # move this OUTSIDE the loop later if you want
-
-            if rng.random() < p_elite:
+            if rng.random() < 0.85:
                 best_score, best_j = topk[0]
             else:
                 best_score, best_j = topk[int(rng.integers(0, len(topk)))]
 
+            if best_score <= 1e-12:
+                break
 
-
-            # place one charger at (best_j, t)
+            # Place one charger
             u_set(best_j, t, u_get(best_j, t) + 1)
+            xcap[best_j] = x_now(best_j, t)
 
-            # capacity-aware uncovered update: greedily mark demand as served up to Q
-            used = 0.0
+            # Capacity-aware uncovered update + local cache update via Ji
+            used  = 0.0
             neigh = Ij_int.get(best_j, [])
-
-            # collect reachable uncovered nodes then sort by demand descending
-            reach = []
-            for i in neigh:
-                ii = int(i)
-                if uncovered[ii]:
-                    reach.append(ii)
-
+            reach = [int(i) for i in neigh if uncovered[int(i)]]
             reach.sort(key=lambda ii: float(demand_IT[t, ii]), reverse=True)
 
             for ii in reach:
@@ -274,8 +297,13 @@ def reconstruct_u_dict_fast(
                 if used + di <= Q + 1e-9:
                     uncovered[ii] = False
                     used += di
+                    # Subtract this demand from every site that could cover ii
+                    if use_cache and Ji is not None:
+                        for j_aff in Ji.get(ii, []):
+                            key = (int(j_aff), t)
+                            if key in delta_cache:
+                                delta_cache[key] = max(0.0, delta_cache[key] - di)
 
-            # NOTE: this is *not* the DR proxy metric; only a local signal.
             proxy_total += used
 
     return U, float(proxy_total)
