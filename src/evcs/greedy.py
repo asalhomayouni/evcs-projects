@@ -150,36 +150,45 @@ def reconstruct_multi_u_greedy(
 
 def reconstruct_u_dict_fast(
     U_partial: dict,           # keys (j,t) -> installs
-    demand_IT,                 # list length T of demand arrays (len M)
+    demand_IT,                 # array (T, M) of demand values
     P_T,
     Ij_int: dict,              # j -> list of i in range
     U_cap: int,
     Q: float,
     rng=None,
     cumulative_install: bool = True,
-    top_k_choice: int = 3,
-    # ── partial-delta cache arguments (optional) ──────────────────────────────
+    top_k_choice: int = 3,    # kept for API compat; heap always picks top-1
+    # ── partial-delta cache (between-iteration warm-start) ────────────────────
     delta_cache: dict | None = None,   # (j, t) -> float, updated in-place
     refresh_ratio: float = 1.0,        # R: fraction of non-destroyed sites to refresh
     destroyed_js: set | None = None,   # sites whose capacity changed (always refresh)
-    Ji: dict | None = None,            # demand node i -> [sites j covering i]
+    Ji: dict | None = None,            # kept for API compat (no longer used)
+    site_coords: np.ndarray | None = None,  # (N, 2) km coords for dist-weighted R%
 ):
     """
-    Greedy reconstruction.  When delta_cache is provided the function reuses
-    marginal-gain scores from the previous D&R iteration and only recomputes
-    scores for (a) the destroyed region and (b) a random R% of other sites.
-    After each greedy placement the cache is updated locally via Ji so that
-    subsequent picks within the same reconstruction see fresh values.
+    Greedy reconstruction with lazy greedy heap and partial-delta cache.
 
-    delta_cache is modified **in-place**; pass an empty dict {} on the first
-    call and the same dict on every subsequent call.
+    Within each period the heap persists across all greedy steps — instead of
+    rescanning all N sites at every step, we pop-recompute-accept/reinsert only
+    what is needed.  By submodularity (marginal gains are non-increasing), a
+    site is accepted as soon as its fresh score >= the next heap top.
+
+    Between D&R iterations, delta_cache carries the scores from the previous
+    reconstruction as warm-start heap values.  destroyed_js + R% of remaining
+    sites are force-refreshed; others start from cache (which serves as a
+    plausible ordering hint, recomputed lazily when popped).
+
+    dist-weighted R%: when site_coords is provided, the random R% fraction is
+    drawn with weight 1/(dist+eps) to the centroid of the destroyed region —
+    sites near the destruction are prioritised for refresh.
+
+    delta_cache is updated **in-place**; pass {} on the first call and reuse.
     """
-    import numpy as np
+    import heapq
 
     if rng is None:
         rng = np.random.default_rng(0)
 
-    # Copy (do not mutate caller)
     U = dict(U_partial)
 
     if Ij_int and len(Ij_int) > 0:
@@ -187,9 +196,9 @@ def reconstruct_u_dict_fast(
     else:
         Js = sorted({int(j) for (j, t) in U.keys()})
 
-    T   = len(P_T)
-    Q   = float(Q)
-    U_cap = int(U_cap)
+    T         = len(P_T)
+    Q         = float(Q)
+    U_cap     = int(U_cap)
     proxy_total = 0.0
     use_cache   = delta_cache is not None
 
@@ -202,31 +211,36 @@ def reconstruct_u_dict_fast(
             return sum(int(U.get((j, tt), 0)) for tt in range(t + 1))
         return int(U.get((j, t), 0))
 
-    # Build Ji (inverse index) once if caching is on and it wasn't supplied
-    if use_cache and Ji is None:
-        Ji = {}
-        for j_key, nodes in Ij_int.items():
-            for i in nodes:
-                Ji.setdefault(int(i), []).append(int(j_key))
-
-    # ── Build refresh set for this reconstruction call ────────────────────────
-    # Sites in refresh_set get their delta recomputed from the uncovered mask.
-    # All other sites use the cached value and are updated locally via Ji.
+    # ── Build refresh set ─────────────────────────────────────────────────────
+    # refresh_set: sites whose delta is recomputed fresh at heap initialisation.
+    # All others start from the cache (stale upper-bound ordering hint).
     if use_cache:
         refresh_set = set(int(j) for j in (destroyed_js or []))
         n_rand = max(0, int(refresh_ratio * len(Js)))
         if n_rand >= len(Js):
-            refresh_set = set(Js)           # full refresh = baseline behaviour
+            refresh_set = set(Js)
         elif n_rand > 0:
-            rand_js = rng.choice(Js, size=n_rand, replace=False)
-            refresh_set.update(int(j) for j in rand_js)
+            candidates = [j for j in Js if j not in refresh_set]
+            if (site_coords is not None
+                    and destroyed_js
+                    and len(candidates) > n_rand):
+                # Distance-weighted: prefer sites near the destroyed centroid
+                c_idx    = np.array(list(destroyed_js), dtype=int)
+                centroid = site_coords[c_idx].mean(axis=0)
+                cand_arr = np.array(candidates)
+                dists    = np.linalg.norm(site_coords[cand_arr] - centroid, axis=1)
+                w = 1.0 / (dists + 0.1)
+                w /= w.sum()
+                chosen = rng.choice(cand_arr, size=n_rand, replace=False, p=w)
+                refresh_set.update(int(j) for j in chosen)
+            else:
+                rand_js = rng.choice(Js, size=n_rand, replace=False)
+                refresh_set.update(int(j) for j in rand_js)
     else:
-        refresh_set = None                  # None means "refresh everything"
+        refresh_set = None
 
     for t in range(T):
-        # Precompute x_now for all sites (avoids O(T) inner calls in hot loop)
-        xcap = {j: x_now(j, t) for j in Js}
-
+        xcap  = {j: x_now(j, t) for j in Js}
         already = sum(u_get(j, t) for j in Js)
         missing = max(0, int(P_T[t]) - int(already))
         if missing <= 0:
@@ -235,74 +249,106 @@ def reconstruct_u_dict_fast(
         M = len(demand_IT[t])
         uncovered = [True] * M
 
-        # After step 0 we switch to Ji-local updates; track with a mutable set
-        needs_fresh = set(refresh_set) if use_cache else None
+        # ── Build initial heap ────────────────────────────────────────────────
+        # The heap must be initialised with UPPER BOUNDS on each site's true
+        # current delta so that the lazy-greedy accept condition is correct.
+        # At step 0, uncovered = all True, so the exact delta = raw_delta[j]
+        # = sum of all demand reachable from j (independent of prior iters).
+        #
+        # * Refresh-set sites: compute fresh → exact raw_delta → written to cache.
+        # * Other sites: delta_cache already holds raw_delta from a previous
+        #   step-0 computation (see invariant below) → valid upper bound.
+        # * Capacity-saturated sites: skipped without touching the cache so that
+        #   raw_delta is preserved for when they become eligible again.
+        #
+        # Cache invariant: delta_cache[(j,t)] is only ever written during step-0
+        # initialisation (where uncovered=all-True), so it always equals raw_delta.
+        heap = []
+        for j in Js:
+            jj = int(j)
+            if xcap[jj] >= U_cap:
+                continue          # skip; preserve cache entry for future iterations
 
-        for step in range(missing):
-            topk = []
+            if (not use_cache) or (refresh_set is None) or jj in refresh_set \
+                    or (jj, t) not in delta_cache:
+                s = 0.0
+                for i in Ij_int.get(jj, []):
+                    s += float(demand_IT[t, int(i)])  # all uncovered at step 0
+                if use_cache:
+                    delta_cache[(jj, t)] = s  # store raw_delta; never overwritten below
+            else:
+                s = max(0.0, delta_cache[(jj, t)])  # = raw_delta from previous iter
 
-            for j in Js:
-                jj = int(j)
-                if xcap[jj] >= U_cap:
-                    if use_cache:
-                        delta_cache[(jj, t)] = 0.0
-                    continue
+            if s > 1e-12:
+                heapq.heappush(heap, (-s, jj))
 
-                if (not use_cache) or jj in needs_fresh or (jj, t) not in delta_cache:
-                    # ── fresh computation ─────────────────────────────────────
-                    s = 0.0
-                    for i in Ij_int.get(jj, []):
-                        if uncovered[int(i)]:
-                            s += float(demand_IT[t, int(i)])
-                    if use_cache:
-                        delta_cache[(jj, t)] = s
-                else:
-                    # ── use cached (locally-updated) score ────────────────────
-                    s = max(0.0, delta_cache[(jj, t)])
+        # ── Lazy greedy: heap persists across all steps in this period ────────
+        k = max(1, int(top_k_choice) if top_k_choice else 1)
 
-                if s > 1e-12:
-                    topk.append((float(s), jj))
+        for _step in range(missing):
+            confirmed = []   # (fresh_s, j) verified as top-k candidates
+            rejects   = []   # to push back after selection
 
-            # After the first greedy step, rely on Ji local updates only
-            if step == 0 and needs_fresh is not None:
-                needs_fresh = set()
+            while heap and len(confirmed) < k:
+                neg_stale, j = heapq.heappop(heap)
+                stale_s = -neg_stale
 
-            if not topk:
+                if stale_s <= 1e-12:
+                    break
+                if xcap[j] >= U_cap:
+                    continue  # preserve cache entry (raw_delta) for future iters
+
+                # Recompute fresh delta against current uncovered mask.
+                # Do NOT write back to delta_cache — that would overwrite the
+                # stored raw_delta with a post-placement underestimate, breaking
+                # the upper-bound invariant for future iterations.
+                fresh_s = 0.0
+                for i in Ij_int.get(j, []):
+                    if uncovered[int(i)]:
+                        fresh_s += float(demand_IT[t, int(i)])
+
+                next_top = (-heap[0][0]) if heap else 0.0
+
+                if fresh_s >= next_top - 1e-9:
+                    # Confirmed as a top-k candidate by submodularity
+                    confirmed.append((fresh_s, j))
+                elif fresh_s > 1e-12:
+                    rejects.append((-fresh_s, j))
+                # else: fully covered by prior placements; discard
+
+            for item in rejects:
+                heapq.heappush(heap, item)
+
+            if not confirmed:
                 break
 
-            k = max(1, int(top_k_choice) if top_k_choice is not None else 1)
-            topk.sort(key=lambda x: x[0], reverse=True)
-            topk = topk[:k]
-
-            if rng.random() < 0.85:
-                best_score, best_j = topk[0]
+            # Elite-biased top-k selection (preserves diversification)
+            if rng.random() < 0.85 or len(confirmed) == 1:
+                best_score, best_j = confirmed[0]
             else:
-                best_score, best_j = topk[int(rng.integers(0, len(topk)))]
+                best_score, best_j = confirmed[int(rng.integers(0, len(confirmed)))]
 
             if best_score <= 1e-12:
                 break
 
-            # Place one charger
+            # Reinsert non-selected confirmed candidates (with their fresh scores)
+            for sc, jj_c in confirmed:
+                if jj_c != best_j and sc > 1e-12:
+                    heapq.heappush(heap, (-sc, jj_c))
+
+            # Place one charger at best_j, period t
             u_set(best_j, t, u_get(best_j, t) + 1)
             xcap[best_j] = x_now(best_j, t)
 
-            # Capacity-aware uncovered update + local cache update via Ji
+            # Capacity-aware uncovered update
             used  = 0.0
-            neigh = Ij_int.get(best_j, [])
-            reach = [int(i) for i in neigh if uncovered[int(i)]]
+            reach = [int(i) for i in Ij_int.get(best_j, []) if uncovered[int(i)]]
             reach.sort(key=lambda ii: float(demand_IT[t, ii]), reverse=True)
-
             for ii in reach:
                 di = float(demand_IT[t, ii])
                 if used + di <= Q + 1e-9:
                     uncovered[ii] = False
                     used += di
-                    # Subtract this demand from every site that could cover ii
-                    if use_cache and Ji is not None:
-                        for j_aff in Ji.get(ii, []):
-                            key = (int(j_aff), t)
-                            if key in delta_cache:
-                                delta_cache[key] = max(0.0, delta_cache[key] - di)
 
             proxy_total += used
 
