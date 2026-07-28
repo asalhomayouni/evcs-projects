@@ -438,7 +438,8 @@ print(f"Plot -> {box_path}")
 
 
 # ── Plot 2: trajectories per method (all seeds) ───────────────────────────────
-fig2, axes2 = plt.subplots(1, len(METHODS), figsize=(16, 4.5), sharey=True)
+fig2, axes2 = plt.subplots(2, 2, figsize=(11, 9), sharey=True)
+axes2 = axes2.flatten()
 fig2.suptitle(
     f"Score trajectories by method — {len(args.seeds)} seeds each",
     fontsize=11, y=1.02,
@@ -462,7 +463,7 @@ for ax_i, method in enumerate(METHODS):
 
     ax_m.set_title(METHOD_LABELS[method], fontsize=10, pad=6)
     ax_m.set_xlabel("Time (s)", fontsize=10)
-    if ax_i == 0:
+    if ax_i % 2 == 0:
         ax_m.set_ylabel("UE score", fontsize=10)
     ax_m.legend(fontsize=9, frameon=False)
     ax_m.grid(axis="y", alpha=0.2, linestyle="--")

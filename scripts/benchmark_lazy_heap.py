@@ -56,9 +56,12 @@ UE_MAX_RANGE = 2.0
 DESTROY_MODES = ["site_swap", "local_remove", "area_destroy"]
 
 INSTANCES = {
-    "Genova": ("center_276_Genova_k825.csv",  825,  180),
-    "Torino": ("center_207_Torino_k1950.csv", 1950, 360),
-    "Milano": ("center_87_Milano_k3375.csv",  3375, 600),
+    "Verona": ("center_146_Verona_k250.csv",   250,   90),
+    "Genova": ("center_276_Genova_k825.csv",   825,  180),
+    "Torino": ("center_207_Torino_k1950.csv", 1950,  360),
+    "Milano": ("center_87_Milano_k3375.csv",  3375,  600),
+    "Napoli": ("center_547_Napoli_k3525.csv", 3525,  660),
+    "Roma":   ("center_432_Roma_k4400.csv",   4400,  780),
 }
 
 # (label, refresh_ratio, use_dist_weight)

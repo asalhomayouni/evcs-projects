@@ -164,6 +164,7 @@ def reconstruct_u_dict_fast(
     destroyed_js: set | None = None,   # sites whose capacity changed (always refresh)
     Ji: dict | None = None,            # kept for API compat (no longer used)
     site_coords: np.ndarray | None = None,  # (N, 2) km coords for dist-weighted R%
+    use_heap: bool = True,             # False -> linear-scan baseline (no lazy heap)
 ):
     """
     Greedy reconstruction with lazy greedy heap and partial-delta cache.
@@ -183,6 +184,13 @@ def reconstruct_u_dict_fast(
     sites near the destruction are prioritised for refresh.
 
     delta_cache is updated **in-place**; pass {} on the first call and reuse.
+
+    use_heap=False switches to a linear-scan baseline: every step re-scans all
+    eligible sites and recomputes their exact marginal gain against the current
+    uncovered mask (the "rescanning all N sites after each placement" that the
+    heap exists to avoid). The cache-aware raw_delta init is still used for
+    step 0 of each period (its value is exact there, uncovered=all True), so
+    cache benefit is isolated to that first pick when the heap is off.
     """
     import heapq
 
@@ -249,11 +257,9 @@ def reconstruct_u_dict_fast(
         M = len(demand_IT[t])
         uncovered = [True] * M
 
-        # ── Build initial heap ────────────────────────────────────────────────
-        # The heap must be initialised with UPPER BOUNDS on each site's true
-        # current delta so that the lazy-greedy accept condition is correct.
-        # At step 0, uncovered = all True, so the exact delta = raw_delta[j]
-        # = sum of all demand reachable from j (independent of prior iters).
+        # ── Build initial scores (raw_delta, cache-aware) ──────────────────────
+        # These are UPPER BOUNDS on each site's true current delta (exact at
+        # step 0, since uncovered=all True), used whether or not the heap is on.
         #
         # * Refresh-set sites: compute fresh → exact raw_delta → written to cache.
         # * Other sites: delta_cache already holds raw_delta from a previous
@@ -263,7 +269,7 @@ def reconstruct_u_dict_fast(
         #
         # Cache invariant: delta_cache[(j,t)] is only ever written during step-0
         # initialisation (where uncovered=all-True), so it always equals raw_delta.
-        heap = []
+        init_scores = {}
         for j in Js:
             jj = int(j)
             if xcap[jj] >= U_cap:
@@ -280,67 +286,13 @@ def reconstruct_u_dict_fast(
                 s = max(0.0, delta_cache[(jj, t)])  # = raw_delta from previous iter
 
             if s > 1e-12:
-                heapq.heappush(heap, (-s, jj))
+                init_scores[jj] = s
 
-        # ── Lazy greedy: heap persists across all steps in this period ────────
         k = max(1, int(top_k_choice) if top_k_choice else 1)
 
-        for _step in range(missing):
-            confirmed = []   # (fresh_s, j) verified as top-k candidates
-            rejects   = []   # to push back after selection
-
-            while heap and len(confirmed) < k:
-                neg_stale, j = heapq.heappop(heap)
-                stale_s = -neg_stale
-
-                if stale_s <= 1e-12:
-                    break
-                if xcap[j] >= U_cap:
-                    continue  # preserve cache entry (raw_delta) for future iters
-
-                # Recompute fresh delta against current uncovered mask.
-                # Do NOT write back to delta_cache — that would overwrite the
-                # stored raw_delta with a post-placement underestimate, breaking
-                # the upper-bound invariant for future iterations.
-                fresh_s = 0.0
-                for i in Ij_int.get(j, []):
-                    if uncovered[int(i)]:
-                        fresh_s += float(demand_IT[t, int(i)])
-
-                next_top = (-heap[0][0]) if heap else 0.0
-
-                if fresh_s >= next_top - 1e-9:
-                    # Confirmed as a top-k candidate by submodularity
-                    confirmed.append((fresh_s, j))
-                elif fresh_s > 1e-12:
-                    rejects.append((-fresh_s, j))
-                # else: fully covered by prior placements; discard
-
-            for item in rejects:
-                heapq.heappush(heap, item)
-
-            if not confirmed:
-                break
-
-            # Elite-biased top-k selection (preserves diversification)
-            if rng.random() < 0.85 or len(confirmed) == 1:
-                best_score, best_j = confirmed[0]
-            else:
-                best_score, best_j = confirmed[int(rng.integers(0, len(confirmed)))]
-
-            if best_score <= 1e-12:
-                break
-
-            # Reinsert non-selected confirmed candidates (with their fresh scores)
-            for sc, jj_c in confirmed:
-                if jj_c != best_j and sc > 1e-12:
-                    heapq.heappush(heap, (-sc, jj_c))
-
-            # Place one charger at best_j, period t
+        def _place(best_j):
             u_set(best_j, t, u_get(best_j, t) + 1)
             xcap[best_j] = x_now(best_j, t)
-
-            # Capacity-aware uncovered update
             used  = 0.0
             reach = [int(i) for i in Ij_int.get(best_j, []) if uncovered[int(i)]]
             reach.sort(key=lambda ii: float(demand_IT[t, ii]), reverse=True)
@@ -349,7 +301,108 @@ def reconstruct_u_dict_fast(
                 if used + di <= Q + 1e-9:
                     uncovered[ii] = False
                     used += di
+            return used
 
-            proxy_total += used
+        if use_heap:
+            # ── Lazy greedy: heap persists across all steps in this period ─────
+            heap = [(-s, jj) for jj, s in init_scores.items()]
+            heapq.heapify(heap)
+
+            for _step in range(missing):
+                confirmed = []   # (fresh_s, j) verified as top-k candidates
+                rejects   = []   # to push back after selection
+
+                while heap and len(confirmed) < k:
+                    neg_stale, j = heapq.heappop(heap)
+                    stale_s = -neg_stale
+
+                    if stale_s <= 1e-12:
+                        break
+                    if xcap[j] >= U_cap:
+                        continue  # preserve cache entry (raw_delta) for future iters
+
+                    # Recompute fresh delta against current uncovered mask.
+                    # Do NOT write back to delta_cache — that would overwrite the
+                    # stored raw_delta with a post-placement underestimate, breaking
+                    # the upper-bound invariant for future iterations.
+                    fresh_s = 0.0
+                    for i in Ij_int.get(j, []):
+                        if uncovered[int(i)]:
+                            fresh_s += float(demand_IT[t, int(i)])
+
+                    next_top = (-heap[0][0]) if heap else 0.0
+
+                    if fresh_s >= next_top - 1e-9:
+                        # Confirmed as a top-k candidate by submodularity
+                        confirmed.append((fresh_s, j))
+                    elif fresh_s > 1e-12:
+                        rejects.append((-fresh_s, j))
+                    # else: fully covered by prior placements; discard
+
+                for item in rejects:
+                    heapq.heappush(heap, item)
+
+                if not confirmed:
+                    break
+
+                # Elite-biased top-k selection (preserves diversification)
+                if rng.random() < 0.85 or len(confirmed) == 1:
+                    best_score, best_j = confirmed[0]
+                else:
+                    best_score, best_j = confirmed[int(rng.integers(0, len(confirmed)))]
+
+                if best_score <= 1e-12:
+                    break
+
+                # Reinsert non-selected confirmed candidates (with their fresh scores)
+                for sc, jj_c in confirmed:
+                    if jj_c != best_j and sc > 1e-12:
+                        heapq.heappush(heap, (-sc, jj_c))
+
+                proxy_total += _place(best_j)
+
+        else:
+            # ── Linear-scan baseline: full rescan of all eligible sites every
+            # step (no lazy heap). Step 0 trusts init_scores (cache-aware and
+            # exact there); steps 1+ always recompute exact fresh_s for every
+            # remaining candidate, so cache offers no benefit past step 0 —
+            # this is what "rescanning all N sites after each placement" means.
+            remaining = dict(init_scores)
+
+            for _step in range(missing):
+                if _step == 0:
+                    cands = [(s, jj) for jj, s in remaining.items() if xcap[jj] < U_cap]
+                else:
+                    cands = []
+                    for jj in list(remaining.keys()):
+                        if xcap[jj] >= U_cap:
+                            remaining.pop(jj, None)
+                            continue
+                        s = 0.0
+                        for i in Ij_int.get(jj, []):
+                            if uncovered[int(i)]:
+                                s += float(demand_IT[t, int(i)])
+                        if s > 1e-12:
+                            cands.append((s, jj))
+                        else:
+                            remaining.pop(jj, None)
+
+                if not cands:
+                    break
+
+                cands.sort(key=lambda x: x[0], reverse=True)
+                kk = min(k, len(cands))
+                topk = cands[:kk]
+
+                if rng.random() < 0.85 or kk == 1:
+                    best_score, best_j = topk[0]
+                else:
+                    best_score, best_j = topk[int(rng.integers(0, kk))]
+
+                if best_score <= 1e-12:
+                    break
+
+                proxy_total += _place(best_j)
+                remaining.pop(best_j, None)
 
     return U, float(proxy_total)
